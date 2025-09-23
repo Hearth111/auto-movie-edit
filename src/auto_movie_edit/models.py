@@ -69,6 +69,7 @@ class TimelineObject:
     identifier: str
     layer: Optional[int]
     resolved: Optional[Asset] = None
+    source_column: Optional[str] = None
 
 @dataclass(slots=True)
 class TimelineFx:
@@ -76,8 +77,10 @@ class TimelineFx:
     fx_id: str
     parameters: Dict[str, Any] = field(default_factory=dict)
     source_column: Optional[str] = None
+    source_key: Optional[str] = None
     column_index: Optional[int] = None
     resolved: Optional[FxPreset] = None
+    applied_parameters: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass(slots=True)
 class TimelineRow:
@@ -104,4 +107,5 @@ class WorkbookData:
     characters: Dict[str, Character] = field(default_factory=dict)
     layers: Dict[str, LayerBand] = field(default_factory=dict)
     timeline: List[TimelineRow] = field(default_factory=list)
-    schema_map: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    schema_map: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
+

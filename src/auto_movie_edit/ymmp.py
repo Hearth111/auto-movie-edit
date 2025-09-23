@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 from datetime import datetime
 
-from .models import Pack, TimelineFx, TimelineObject, TimelineRow, WorkbookData
+from .models import FxPreset, Pack, TimelineFx, TimelineObject, TimelineRow, WorkbookData
 from .utils import dump_json, contains_hiragana
 
 class BuildWarning:
@@ -24,6 +24,7 @@ class ProjectBuilder:
         self.scaffold_path = project_root / "scaffold.ymmp"
         self.characters_in_use: Set[str] = set()
         self.band_width = 10
+        self.history_entries: List[Dict[str, Any]] = []
         self.tachie_scaffold = {
             "$type": "YukkuriMovieMaker.Project.Items.TachieItem, YukkuriMovieMaker",
             "CharacterName": "キャラクター名",
@@ -146,11 +147,13 @@ class ProjectBuilder:
         # FX presets
         for fx in row.fxs:
             fx_items = self._instantiate_fx(fx, row)
-            fx_band = self._infer_layer_band(fx.source_column or fx.fx_id)
-            register(fx_items, fx.source_column or fx.fx_id, order_counter, fx_band)
+            band_reference = fx.source_key or fx.source_column or fx.fx_id
+            fx_band = self._infer_layer_band(band_reference)
+            register(fx_items, band_reference, order_counter, fx_band)
             order_counter += 1
 
         self._finalize_layers(placements)
+        self._record_history(row, placements)
         return [p["item"] for p in placements]
 
     def _create_item_from_template(self, template: dict | list | None, row: TimelineRow) -> dict:
@@ -258,13 +261,44 @@ class ProjectBuilder:
         else:
             self._warn(row, f"FX preset '{fx.fx_id}' has no source or asset")
 
+        self._validate_fx_parameters(fx, preset, row)
         combined_params = self._deep_copy(preset.parameters) if preset.parameters else {}
         if fx.parameters:
             combined_params = self._merge_parameters(combined_params, fx.parameters)
         if combined_params:
             for item in items:
                 self._apply_parameters(item, combined_params)
+        fx.applied_parameters = combined_params if combined_params else {}
         return items
+
+    def _validate_fx_parameters(self, fx: TimelineFx, preset: FxPreset, row: TimelineRow) -> None:
+        if not fx.parameters:
+            return
+        if preset.parameters:
+            expected = self._flatten_structure_keys(preset.parameters)
+            provided = self._flatten_structure_keys(fx.parameters)
+            unknown = provided - expected
+            if unknown:
+                self._warn(
+                    row,
+                    f"FX '{fx.fx_id}' overrides unknown parameter(s): {', '.join(sorted(unknown))}",
+                )
+        else:
+            self._warn(row, f"FX '{fx.fx_id}' has no base parameters but overrides were provided")
+
+    def _flatten_structure_keys(self, data: Any, prefix: str = "") -> Set[str]:
+        keys: Set[str] = set()
+        if isinstance(data, dict):
+            for key, value in data.items():
+                new_prefix = f"{prefix}.{key}" if prefix else str(key)
+                keys.add(new_prefix)
+                keys.update(self._flatten_structure_keys(value, new_prefix))
+        elif isinstance(data, list):
+            for index, value in enumerate(data):
+                new_prefix = f"{prefix}[{index}]" if prefix else f"[{index}]"
+                keys.add(new_prefix)
+                keys.update(self._flatten_structure_keys(value, new_prefix))
+        return keys
 
     def _apply_parameters(self, target: dict[str, Any], overrides: Dict[str, Any]) -> None:
         for key, value in overrides.items():
@@ -333,16 +367,97 @@ class ProjectBuilder:
 
     def _warn(self, row: TimelineRow, message: str): self.warnings.append(BuildWarning(row.index, message))
 
-def build_project(data: WorkbookData) -> Tuple[dict, List]:
-    builder = ProjectBuilder(data)
-    return builder.build(), builder.warnings
+    def _record_history(self, row: TimelineRow, placements: List[dict[str, Any]]) -> None:
+        timestamp = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        history_entry: Dict[str, Any] = {
+            "timestamp": timestamp,
+            "row_index": row.index,
+            "start": row.start.to_string() if row.start else None,
+            "end": row.end.to_string() if row.end else None,
+            "subtitle": row.subtitle,
+            "telop": row.telop,
+            "character": row.character,
+            "expressions": dict(row.expressions),
+            "packs": list(row.packs),
+            "objects": [
+                {
+                    "role": obj.role,
+                    "source_column": obj.source_column,
+                    "identifier": obj.identifier,
+                    "resolved_asset": obj.resolved.asset_id if obj.resolved else None,
+                    "asset_path": obj.resolved.path if obj.resolved and obj.resolved.path else None,
+                }
+                for obj in row.objects
+            ],
+            "fx": [
+                {
+                    "fx_id": fx.fx_id,
+                    "source_column": fx.source_column,
+                    "source_key": fx.source_key,
+                    "parameters": fx.parameters,
+                    "applied_parameters": fx.applied_parameters,
+                    "preset": {
+                        "type": fx.resolved.fx_type if fx.resolved else None,
+                        "source": fx.resolved.source if fx.resolved else None,
+                        "asset": fx.resolved.asset if fx.resolved else None,
+                    },
+                }
+                for fx in row.fxs
+            ],
+            "notes": dict(row.notes),
+        }
+        history_entry["generated_items"] = [
+            {
+                "role": placement.get("role"),
+                "layer": placement.get("item", {}).get("Layer"),
+                "type": placement.get("item", {}).get("$type"),
+            }
+            for placement in placements
+        ]
+        self.history_entries.append(history_entry)
 
-def write_outputs(project: dict, warnings: List, output_dir: str | Path):
+def build_project(data: WorkbookData) -> Tuple[dict, List, List[Dict[str, Any]]]:
+    builder = ProjectBuilder(data)
+    project = builder.build()
+    return project, builder.warnings, builder.history_entries
+
+def write_outputs(project: dict, warnings: List, output_dir: str | Path, history: List[Dict[str, Any]] | None = None):
     output_path = Path(output_dir); output_path.mkdir(parents=True, exist_ok=True)
     project["FilePath"] = str((output_path / "out.ymmp").resolve())
     dump_json(output_path / "out.ymmp", project)
     report = {"generated_at": datetime.utcnow().isoformat("T") + "Z", "warnings": [w.to_dict() for w in warnings]}
+    history_count = _write_history_entries(history or [], warnings, output_path)
+    if history_count:
+        report["history"] = {
+            "count": history_count,
+            "directory": str((output_path / "history").resolve()),
+        }
     dump_json(output_path / "report.json", report)
+
+def _write_history_entries(history: List[Dict[str, Any]], warnings: List[BuildWarning], output_path: Path) -> int:
+    if not history:
+        return 0
+    warning_map: Dict[int, List[str]] = {}
+    for warning in warnings:
+        if warning.row_index is None:
+            continue
+        warning_map.setdefault(warning.row_index, []).append(warning.message)
+
+    enriched: List[Dict[str, Any]] = []
+    for entry in history:
+        row_index = entry.get("row_index")
+        enriched_entry = dict(entry)
+        if row_index in warning_map:
+            enriched_entry["warnings"] = warning_map[row_index]
+        enriched.append(enriched_entry)
+
+    date_dir = output_path / "history" / datetime.utcnow().strftime("%Y%m%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
+    history_path = date_dir / "history.jsonl"
+    with history_path.open("a", encoding="utf-8") as fh:
+        for entry in enriched:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return len(enriched)
 
 def apply_hiragana_shrink(project_path: str | Path, output_path: str | Path, scale: float):
     project = json.loads(Path(project_path).read_text("utf-8-sig"))
