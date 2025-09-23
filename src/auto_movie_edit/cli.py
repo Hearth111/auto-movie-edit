@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import md5
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -139,12 +140,95 @@ def _extract_assets_from_raw_ymmp(project: dict, xlsx_path: Path) -> dict:
     return extracted
 
 
+def _extract_packs_from_raw_ymmp(project: dict, xlsx_path: Path) -> dict:
+    """Extracts multi-object packs from timeline items."""
+    typer.secho("Extracting pack patterns...", fg=typer.colors.CYAN)
+    extracted: Dict[str, Dict[str, Any]] = {}
+    template_dir = xlsx_path.parent / "templates" / "packs"
+    template_dir.mkdir(parents=True, exist_ok=True)
+
+    seen_hashes: set[str] = set()
+    items = project.get("Timelines", [{}])[0].get("Items", [])
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if not _looks_like_pack(item):
+            continue
+
+        sanitized = _strip_runtime_fields(item)
+        digest = _hash_template(sanitized)
+        if digest in seen_hashes:
+            continue
+        seen_hashes.add(digest)
+
+        pack_id = f"pack_{digest[:8]}"
+        template_path = template_dir / f"{_safe_filename(pack_id)}.json"
+        template_path.write_text(json.dumps(sanitized, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        extracted[pack_id] = {
+            "pack_id": pack_id,
+            "source": _relative_template_path(template_path, xlsx_path.parent),
+            "notes": f"Extracted from {Path(project.get('FilePath', 'source.ymmp')).name}",
+        }
+
+    typer.secho(f"Found {len(extracted)} pack patterns.", fg=typer.colors.GREEN)
+    return extracted
+
+
+def _extract_fx_from_raw_ymmp(project: dict, xlsx_path: Path, packs: Dict[str, Dict[str, Any]]) -> dict:
+    """Extracts FX presets by mirroring effect items as packs."""
+    typer.secho("Extracting FX presets...", fg=typer.colors.CYAN)
+    extracted: Dict[str, Dict[str, Any]] = {}
+    fx_dir = xlsx_path.parent / "templates" / "fx"
+    fx_dir.mkdir(parents=True, exist_ok=True)
+    pack_dir = xlsx_path.parent / "templates" / "packs"
+    pack_dir.mkdir(parents=True, exist_ok=True)
+
+    items = project.get("Timelines", [{}])[0].get("Items", [])
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("$type", "")
+        if not _looks_like_fx(item_type):
+            continue
+
+        sanitized = _strip_runtime_fields(item)
+        digest = _hash_template(sanitized)
+        fx_id = f"fx_{digest[:8]}"
+        if fx_id in extracted:
+            continue
+
+        fx_template_path = fx_dir / f"{_safe_filename(fx_id)}.json"
+        fx_template_path.write_text(json.dumps(sanitized, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        pack_id = f"pack_{digest[:8]}"
+        if pack_id not in packs:
+            pack_template_path = pack_dir / f"{_safe_filename(pack_id)}.json"
+            if not pack_template_path.exists():
+                pack_template_path.write_text(json.dumps(sanitized, ensure_ascii=False, indent=2), encoding="utf-8")
+            packs[pack_id] = {
+                "pack_id": pack_id,
+                "source": _relative_template_path(pack_template_path, xlsx_path.parent),
+                "notes": "Auto-generated from FX item",
+            }
+
+        extracted[fx_id] = {
+            "fx_id": fx_id,
+            "fx_type": _infer_fx_type(item_type),
+            "source": pack_id,
+        }
+
+    typer.secho(f"Found {len(extracted)} FX presets.", fg=typer.colors.GREEN)
+    return extracted
+
+
 @app.command("absorb")
 def absorb(
     ymmp: Path = typer.Option(..., exists=True, dir_okay=False, readable=True, help="Source YMMP JSON"),
     xlsx: Path = typer.Option(..., dir_okay=False, help="Workbook to update"),
 ) -> None:
     """Absorb a YMMP file into the workbook dictionaries."""
+    xlsx = xlsx.resolve()
     try:
         project = json.loads(ymmp.read_text(encoding="utf-8-sig"))
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -156,15 +240,34 @@ def absorb(
     else:
         workbook = create_workbook_template(DEFAULT_TEMPLATE)
         
-    if "telop_patterns" in project or "assets" in project: # Tool-generated file
-        telop_patterns = project.get("telop_patterns", {})
-        assets = project.get("assets", {})
-    else: # Raw YMM4 file
+    base_dir = xlsx.parent
+    if (
+        "telop_patterns" in project
+        or "assets" in project
+        or "packs" in project
+        or "fx_presets" in project
+    ):  # Tool-generated file
+        telop_raw = project.get("telop_patterns", {})
+        asset_raw = project.get("assets", {})
+        pack_raw = project.get("packs", {})
+        fx_raw = project.get("fx_presets", project.get("fx", {}))
+
+        telop_patterns = telop_raw if isinstance(telop_raw, dict) else {}
+        assets = asset_raw if isinstance(asset_raw, dict) else {}
+        packs = pack_raw if isinstance(pack_raw, dict) else {}
+        fx_presets = fx_raw if isinstance(fx_raw, dict) else {}
+    else:  # Raw YMM4 file
         telop_patterns = _extract_telops_from_raw_ymmp(project, xlsx)
         assets = _extract_assets_from_raw_ymmp(project, xlsx)
+        packs = _extract_packs_from_raw_ymmp(project, xlsx)
+        fx_presets = _extract_fx_from_raw_ymmp(project, xlsx, packs)
+
+    _prepare_templates_for_sync(base_dir, telop_patterns, assets, packs)
 
     _sync_dictionary_sheet(workbook, "TELP_PATTERNS", DEFAULT_TEMPLATE.telp_headers, telop_patterns)
     _sync_dictionary_sheet(workbook, "ASSETS_SINGLE", DEFAULT_TEMPLATE.asset_headers, assets)
+    _sync_dictionary_sheet(workbook, "PACKS_MULTI", DEFAULT_TEMPLATE.pack_headers, packs)
+    _sync_dictionary_sheet(workbook, "FX", DEFAULT_TEMPLATE.fx_headers, fx_presets)
     
     save_workbook(workbook, xlsx)
     typer.secho(f"Workbook updated with project dictionaries -> {xlsx}", fg=typer.colors.GREEN)
@@ -214,6 +317,99 @@ def _map_header_to_field(header: str) -> str:
         "パック": "source", "アセット": "asset", "パラメータ": "parameters",
     }
     return mapping.get(header, header.lower().replace(" ", "_"))
+
+
+def _prepare_templates_for_sync(
+    base_dir: Path,
+    telops: Dict[str, Dict[str, Any]],
+    assets: Dict[str, Dict[str, Any]],
+    packs: Dict[str, Dict[str, Any]],
+) -> None:
+    for key, payload in telops.items():
+        _persist_template_payload(base_dir, "telops", key, payload, "overrides", "source")
+
+    for key, payload in assets.items():
+        _persist_template_payload(base_dir, "assets", key, payload, "parameters", "path")
+
+    for key, payload in packs.items():
+        _persist_template_payload(base_dir, "packs", key, payload, "overrides", "source")
+
+
+def _persist_template_payload(
+    base_dir: Path,
+    category: str,
+    identifier: str,
+    payload: Dict[str, Any],
+    data_field: str,
+    path_field: str,
+) -> None:
+    if not isinstance(payload, dict):
+        return
+
+    template_data = payload.get(data_field)
+    if not isinstance(template_data, (dict, list)) or not template_data:
+        return
+
+    template_dir = base_dir / "templates" / category
+    template_dir.mkdir(parents=True, exist_ok=True)
+    template_path = template_dir / f"{_safe_filename(identifier)}.json"
+    template_path.write_text(json.dumps(template_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    relative_path = _relative_template_path(template_path, base_dir)
+    payload[path_field] = relative_path
+    payload[data_field] = None
+
+
+def _relative_template_path(path: Path, base_dir: Path) -> str:
+    try:
+        return path.relative_to(base_dir).as_posix()
+    except ValueError:
+        return path.resolve().as_posix()
+
+
+def _safe_filename(identifier: str) -> str:
+    sanitized = identifier.replace("\\", "_").replace("/", "_").replace(":", "_")
+    return sanitized or "template"
+
+
+def _strip_runtime_fields(data: Any) -> Any:
+    if isinstance(data, dict):
+        return {
+            key: _strip_runtime_fields(value)
+            for key, value in data.items()
+            if key not in {"Frame", "Length"}
+        }
+    if isinstance(data, list):
+        return [_strip_runtime_fields(item) for item in data]
+    return data
+
+
+def _hash_template(data: Any) -> str:
+    serialized = json.dumps(data, ensure_ascii=False, sort_keys=True)
+    return md5(serialized.encode("utf-8")).hexdigest()
+
+
+def _looks_like_pack(item: Dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if isinstance(item.get("Items"), list) and item["Items"]:
+        return True
+    item_type = item.get("$type", "")
+    return any(keyword in item_type for keyword in ("Group", "Repeat", "Tachie"))
+
+
+def _looks_like_fx(item_type: str) -> bool:
+    if not isinstance(item_type, str):
+        return False
+    candidates = ("Effect", "Zoom", "Shake", "Blur", "Speedline", "Vignette", "Filter")
+    return any(keyword.lower() in item_type.lower() for keyword in candidates)
+
+
+def _infer_fx_type(item_type: str) -> str:
+    if not item_type:
+        return "fx"
+    base = item_type.split(",")[0].split(".")[-1]
+    return base.replace("Item", "").lower() or "fx"
 
 if __name__ == "__main__":
     app()
