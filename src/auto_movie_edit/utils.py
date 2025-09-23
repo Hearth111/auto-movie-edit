@@ -61,7 +61,11 @@ def parse_timecode(value: str | None) -> Optional[Timecode]:
     if value is None:
         return None
 
-    value = value.strip()
+    # ★★★ ここが修正点です ★★★
+    # SRTファイルのカンマ区切りに対応するため、ピリオドに置換します
+    value = value.strip().replace(",", ".")
+    # ★★★ 修正ここまで ★★★
+    
     if not value:
         return None
 
@@ -70,7 +74,12 @@ def parse_timecode(value: str | None) -> Optional[Timecode]:
         raise TimecodeError(f"Invalid timecode: {value!r}")
 
     millis = match.group("millis")
-    milliseconds = int(millis) if millis else 0
+    # ミリ秒が3桁に満たない場合（例: .5）でも正しく処理するように調整
+    if millis:
+        milliseconds = int(millis.ljust(3, '0'))
+    else:
+        milliseconds = 0
+        
     return Timecode(
         hours=int(match.group("hour")),
         minutes=int(match.group("minute")),
