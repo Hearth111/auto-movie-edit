@@ -11,6 +11,7 @@ import typer
 from openpyxl import Workbook, load_workbook
 
 from .srt import SrtParseError, parse_srt
+from .proposals import ProposalModel
 from .workbook import (
     DEFAULT_TEMPLATE,
     create_workbook_template,
@@ -26,6 +27,12 @@ app = typer.Typer(help="Auto Movie Edit CLI utilities")
 def make_sheet(
     srt: Path = typer.Option(..., exists=True, dir_okay=False, readable=True, help="SRT subtitle file"),
     out: Path = typer.Option(..., dir_okay=False, help="Output Excel file"),
+    knowledge_base: Path = typer.Option(
+        Path("work/ai/proposal_model.json"),
+        dir_okay=False,
+        exists=False,
+        help="AI提案モデルのパス。存在する場合は提案結果をTIMELINEに自動入力する。",
+    ),
 ) -> None:
     """Create a workbook template populated with SRT subtitles."""
     try:
@@ -37,10 +44,43 @@ def make_sheet(
     workbook = create_workbook_template(DEFAULT_TEMPLATE)
     timeline_sheet = workbook["TIMELINE"]
 
+    proposal_model: ProposalModel | None = None
+    if knowledge_base and knowledge_base.exists():
+        proposal_model = ProposalModel.load(knowledge_base)
+
     for row_index, entry in enumerate(entries, start=2):
         timeline_sheet.cell(row=row_index, column=1, value=entry.start.to_string())
         timeline_sheet.cell(row=row_index, column=2, value=entry.end.to_string())
         timeline_sheet.cell(row=row_index, column=3, value=entry.text)
+
+        if proposal_model:
+            suggestions = proposal_model.suggest(entry.text)
+            if suggestions.has_data():
+                telops = suggestions.top("telop")
+                if telops:
+                    timeline_sheet.cell(row=row_index, column=4, value=telops[0])
+                packs = suggestions.top("pack")
+                if packs:
+                    timeline_sheet.cell(row=row_index, column=9, value=packs[0])
+                assets = suggestions.top("asset")
+                if assets:
+                    timeline_sheet.cell(row=row_index, column=10, value=assets[0])
+                memo_segments = []
+                if telops:
+                    memo_segments.append(f"テロップ:{', '.join(telops[:3])}")
+                if packs:
+                    memo_segments.append(f"パック:{', '.join(packs[:3])}")
+                if assets:
+                    memo_segments.append(f"オブジェクト:{', '.join(assets[:3])}")
+                fx_candidates = suggestions.top("fx", limit=3)
+                if fx_candidates:
+                    memo_segments.append(f"FX:{', '.join(fx_candidates)}")
+                if memo_segments:
+                    timeline_sheet.cell(
+                        row=row_index,
+                        column=16,
+                        value="AI候補 " + " / ".join(memo_segments),
+                    )
 
     save_workbook(workbook, out)
     typer.secho(f"Workbook created: {out}", fg=typer.colors.GREEN)

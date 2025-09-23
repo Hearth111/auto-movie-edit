@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Set, Tuple
 from datetime import datetime
 
 from .models import FxPreset, Pack, TimelineFx, TimelineObject, TimelineRow, WorkbookData
+from .proposals import update_proposal_model
 from .utils import dump_json, contains_hiragana
 
 class BuildWarning:
@@ -426,12 +427,16 @@ def write_outputs(project: dict, warnings: List, output_dir: str | Path, history
     project["FilePath"] = str((output_path / "out.ymmp").resolve())
     dump_json(output_path / "out.ymmp", project)
     report = {"generated_at": datetime.utcnow().isoformat("T") + "Z", "warnings": [w.to_dict() for w in warnings]}
-    history_count = _write_history_entries(history or [], warnings, output_path)
+    history_entries = history or []
+    history_count = _write_history_entries(history_entries, warnings, output_path)
+    model_path = update_proposal_model(history_entries, output_path)
     if history_count:
         report["history"] = {
             "count": history_count,
             "directory": str((output_path / "history").resolve()),
         }
+    if model_path:
+        report.setdefault("ai", {})["proposal_model"] = str(Path(model_path).resolve())
     dump_json(output_path / "report.json", report)
 
 def _write_history_entries(history: List[Dict[str, Any]], warnings: List[BuildWarning], output_path: Path) -> int:
