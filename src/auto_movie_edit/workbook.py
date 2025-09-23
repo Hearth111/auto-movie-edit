@@ -200,10 +200,18 @@ def load_workbook_data(path: str | Path) -> WorkbookData:
                 total_fx = sum(len(values) for values in fx_values.values())
                 fx_param_raw = _parse_fx_params(r.get("FX_PARAM"))
                 fxs: List[TimelineFx] = []
-                for column, values in fx_values.items():
+                for column_index, column in enumerate(fx_cols):
+                    values = fx_values.get(column, [])
                     for fx_id in values:
                         params = _select_fx_parameters(fx_param_raw, fx_id, column, total_fx)
-                        fxs.append(TimelineFx(fx_id=fx_id, parameters=params))
+                        fxs.append(
+                            TimelineFx(
+                                fx_id=fx_id,
+                                parameters=params,
+                                source_column=column,
+                                column_index=column_index,
+                            )
+                        )
                 notes: Dict[str, Any] = {}
                 if fx_param_raw not in (None, {}):
                     notes["fx_params"] = fx_param_raw

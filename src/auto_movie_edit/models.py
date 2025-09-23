@@ -75,6 +75,8 @@ class TimelineFx:
     """Represents FX applied to a timeline row."""
     fx_id: str
     parameters: Dict[str, Any] = field(default_factory=dict)
+    source_column: Optional[str] = None
+    column_index: Optional[int] = None
     resolved: Optional[FxPreset] = None
 
 @dataclass(slots=True)

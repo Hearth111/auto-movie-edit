@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 import json
-import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 from datetime import datetime
 
-from .models import TimelineRow, WorkbookData
+from .models import Pack, TimelineFx, TimelineObject, TimelineRow, WorkbookData
 from .utils import dump_json, contains_hiragana
 
 class BuildWarning:
@@ -24,6 +23,7 @@ class ProjectBuilder:
         project_root = Path(__file__).resolve().parent.parent.parent
         self.scaffold_path = project_root / "scaffold.ymmp"
         self.characters_in_use: Set[str] = set()
+        self.band_width = 10
         self.tachie_scaffold = {
             "$type": "YukkuriMovieMaker.Project.Items.TachieItem, YukkuriMovieMaker",
             "CharacterName": "キャラクター名",
@@ -40,18 +40,16 @@ class ProjectBuilder:
         """Builds the final YMM4 project by injecting items and characters into a scaffold file."""
         if not self.scaffold_path.exists(): raise FileNotFoundError(f"Scaffold file not found: '{self.scaffold_path}'")
         project = json.loads(self.scaffold_path.read_text("utf-8-sig"))
-        
-        # --- ★★★ ここが修正点 ★★★ ---
-        # 1. Process all timeline items first to collect all necessary data, including characters in use.
-        timeline_items = [item for row in self.data.timeline for item in self._build_row_items(row)]
-        
-        # 2. Now that self.characters_in_use is populated, create the definitions.
-        # Also add any characters defined in the CHARACTERS sheet, even if not used on the timeline.
+
+        timeline_items: List[dict[str, Any]] = []
+        for row in self.data.timeline:
+            timeline_items.extend(self._build_row_items(row))
+
         for name in self.data.characters:
             self.characters_in_use.add(name)
-        
+
         character_definitions = [{"Name": name, "Color": "#FFFFFFFF"} for name in self.characters_in_use]
-        
+
         # 3. Inject everything into the project structure's two required locations.
         project["Characters"] = character_definitions
         if project.get("Timelines"):
@@ -62,54 +60,276 @@ class ProjectBuilder:
 
     def _build_row_items(self, row: TimelineRow) -> List[dict[str, Any]]:
         """Builds timeline items and collects character names used in the row."""
-        items = []
+        placements: List[dict[str, Any]] = []
+        order_counter = 0
+
+        def register(items: List[dict[str, Any]], role: str | None, order: float, band: int | None = None) -> None:
+            if not items:
+                return
+            inferred_band = band if band is not None else self._infer_layer_band(role)
+            for offset, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                placements.append(
+                    {
+                        "item": item,
+                        "band": inferred_band,
+                        "order": order + offset * 0.01,
+                        "explicit": "Layer" in item,
+                        "role": role,
+                        "row": row,
+                    }
+                )
+                self._register_characters_from_item(item)
+                self._warn_unresolved_filepaths(row, role, item)
+
         # Telop logic
-        if row.telop and (pattern := self.data.telop_patterns.get(row.telop)):
-            try:
-                telop_item = self._create_item_from_template(pattern.overrides, row)
-                telop_item["Text"] = row.subtitle
-                if "Layer" not in telop_item: telop_item["Layer"] = 80
-                items.append(telop_item)
-            except Exception as e: self._warn(row, f"Telop build error for '{row.telop}': {e}")
-        
-        # Dynamic Tachie (from CHARACTERS sheet) logic
-        if row.character and row.expressions and (char_def := self.data.characters.get(row.character)):
-            try:
-                self.characters_in_use.add(char_def.name) # Register character name
-                tachie_item = self._create_item_from_template(self.tachie_scaffold, row)
-                tachie_item["CharacterName"] = char_def.name
-                params = tachie_item["TachieItemParameter"]
-                for part_jp, expr_fn in row.expressions.items():
-                    if (part_en := self.part_map.get(part_jp)) and (base_path := char_def.parts.get(part_jp)):
-                        params[part_en] = str((Path(base_path) / f"{expr_fn}.png").resolve())
-                if layer := self.data.layers.get("立ち絵"): tachie_item["Layer"] = layer.layer
-                items.append(tachie_item)
-            except Exception as e: self._warn(row, f"Dynamic Tachie build error: {e}")
-        
-        # Static Asset (including pre-absorbed Tachie) logic
-        for obj in row.objects:
-            if asset := self.data.assets.get(obj.identifier):
+        if row.telop:
+            pattern = self.data.telop_patterns.get(row.telop)
+            if not pattern:
+                self._warn(row, f"Telop pattern not found: {row.telop}")
+            else:
                 try:
-                    asset_item = self._create_item_from_template(asset.parameters, row)
-                    # If this asset is a Tachie, find its character name and register it
-                    if asset.kind == "tachie" and (char_name := asset_item.get("CharacterName")):
-                        self.characters_in_use.add(char_name)
-                    
-                    if obj.layer is not None: asset_item["Layer"] = obj.layer
-                    elif asset.default_layer is not None: asset_item["Layer"] = asset.default_layer
-                    elif "Layer" not in asset_item: asset_item["Layer"] = 70
-                    items.append(asset_item)
-                except Exception as e: self._warn(row, f"Asset build error for '{obj.identifier}': {e}")
-            else: self._warn(row, f"Asset not found: {obj.identifier}")
-            
+                    telop_item = self._create_item_from_template(pattern.overrides, row)
+                    if row.subtitle and "Text" not in telop_item:
+                        telop_item["Text"] = row.subtitle
+                    elif row.subtitle:
+                        telop_item["Text"] = row.subtitle
+                    register([telop_item], "テロップ", order_counter, self._infer_layer_band("テロップ"))
+                except Exception as exc:  # pragma: no cover - defensive path
+                    self._warn(row, f"Telop build error for '{row.telop}': {exc}")
+            order_counter += 1
+
+        # Dynamic Tachie logic
+        if row.character:
+            char_def = self.data.characters.get(row.character)
+            if not char_def:
+                self._warn(row, f"Character not found: {row.character}")
+            elif not row.expressions:
+                self._warn(row, f"No expressions provided for character '{row.character}'")
+            else:
+                try:
+                    self.characters_in_use.add(char_def.name)
+                    tachie_item = self._create_item_from_template(self.tachie_scaffold, row)
+                    tachie_item["CharacterName"] = char_def.name
+                    params = tachie_item.setdefault("TachieItemParameter", {})
+                    for part_jp, expr_fn in row.expressions.items():
+                        part_en = self.part_map.get(part_jp)
+                        base_path = char_def.parts.get(part_jp) if char_def else None
+                        if part_en and base_path:
+                            params[part_en] = str((Path(base_path) / f"{expr_fn}.png").resolve())
+                        elif not part_en:
+                            self._warn(row, f"Unknown tachie part: {part_jp}")
+                        else:
+                            self._warn(row, f"Tachie base path missing for part '{part_jp}' of character '{char_def.name}'")
+                    register([tachie_item], "立ち絵", order_counter, self._infer_layer_band("立ち絵"))
+                except Exception as exc:  # pragma: no cover - defensive path
+                    self._warn(row, f"Dynamic Tachie build error: {exc}")
+            order_counter += 1
+
+        # Packs applied on the row
+        for pack_id in row.packs:
+            if pack := self.data.packs.get(pack_id):
+                pack_items = self._instantiate_pack(pack, row)
+                register(pack_items, "パック", order_counter, self._infer_layer_band("パック"))
+            else:
+                self._warn(row, f"Pack not found: {pack_id}")
+            order_counter += 1
+
+        # Static assets and direct objects
+        for obj_index, obj in enumerate(row.objects):
+            placements_for_object = self._instantiate_object(obj, row)
+            base_band = obj.layer if obj.layer is not None else self._infer_layer_band(obj.role)
+            register(placements_for_object, obj.role, order_counter, base_band)
+            order_counter += 1
+
+        # FX presets
+        for fx in row.fxs:
+            fx_items = self._instantiate_fx(fx, row)
+            fx_band = self._infer_layer_band(fx.source_column or fx.fx_id)
+            register(fx_items, fx.source_column or fx.fx_id, order_counter, fx_band)
+            order_counter += 1
+
+        self._finalize_layers(placements)
+        return [p["item"] for p in placements]
+
+    def _create_item_from_template(self, template: dict | list | None, row: TimelineRow) -> dict:
+        if template is None:
+            raise TypeError("Template data is missing.")
+        if isinstance(template, list):
+            if not template:
+                raise ValueError("Template list is empty.")
+            template = template[0]
+        if not isinstance(template, dict):
+            raise TypeError("Template data must be a dictionary.")
+        item = self._deep_copy(template)
+        if row.start:
+            item.setdefault("Frame", int(row.start.to_seconds() * self.fps))
+        if row.start and row.end:
+            length = int(max(0, row.end.to_seconds() - row.start.to_seconds()) * self.fps)
+            item.setdefault("Length", length)
+        return item
+
+    def _instantiate_object(self, obj: TimelineObject, row: TimelineRow) -> List[dict[str, Any]]:
+        items: List[dict[str, Any]] = []
+        asset = self.data.assets.get(obj.identifier)
+        if not asset:
+            self._warn(row, f"Asset not found: {obj.identifier}")
+            return items
+        obj.resolved = asset
+        if not asset.parameters:
+            self._warn(row, f"Asset '{asset.asset_id}' has no template parameters")
+            return items
+        templates = asset.parameters if isinstance(asset.parameters, list) else [asset.parameters]
+        for template in templates:
+            try:
+                item = self._create_item_from_template(template, row)
+            except Exception as exc:  # pragma: no cover - defensive path
+                self._warn(row, f"Asset build error for '{obj.identifier}': {exc}")
+                continue
+            if asset.path and "FilePath" not in item:
+                item["FilePath"] = asset.path
+            if asset.default_x is not None:
+                item.setdefault("X", asset.default_x)
+            if asset.default_y is not None:
+                item.setdefault("Y", asset.default_y)
+            if asset.default_zoom is not None:
+                item.setdefault("Zoom", asset.default_zoom)
+            if obj.layer is not None:
+                item.setdefault("Layer", obj.layer)
+            elif asset.default_layer is not None:
+                item.setdefault("Layer", asset.default_layer)
+            if asset.kind == "tachie" and (char_name := item.get("CharacterName")):
+                self.characters_in_use.add(char_name)
+            items.append(item)
         return items
 
-    def _create_item_from_template(self, template: dict, row: TimelineRow) -> dict:
-        if not isinstance(template, dict): raise TypeError("Template data must be a dictionary.")
-        item = json.loads(json.dumps(template))
-        if row.start: item["Frame"] = int(row.start.to_seconds() * self.fps)
-        if row.start and row.end: item["Length"] = int(max(0, row.end.to_seconds() - row.start.to_seconds()) * self.fps)
-        return item
+    def _instantiate_pack(self, pack: Pack, row: TimelineRow) -> List[dict[str, Any]]:
+        template = pack.overrides
+        if template is None:
+            self._warn(row, f"Pack '{pack.pack_id}' has no template data")
+            return []
+        if isinstance(template, dict):
+            if "Items" in template and isinstance(template["Items"], list):
+                source_items = template["Items"]
+            elif "$type" in template:
+                source_items = [template]
+            else:
+                source_items = []
+        elif isinstance(template, list):
+            source_items = template
+        else:
+            self._warn(row, f"Unsupported pack template format for '{pack.pack_id}'")
+            return []
+        if not source_items:
+            self._warn(row, f"Pack '{pack.pack_id}' has no items")
+            return []
+        instantiated: List[dict[str, Any]] = []
+        for base_item in source_items:
+            try:
+                item = self._create_item_from_template(base_item, row)
+            except Exception as exc:  # pragma: no cover - defensive path
+                self._warn(row, f"Pack '{pack.pack_id}' build error: {exc}")
+                continue
+            instantiated.append(item)
+        return instantiated
+
+    def _instantiate_fx(self, fx: TimelineFx, row: TimelineRow) -> List[dict[str, Any]]:
+        preset = self.data.fx_presets.get(fx.fx_id)
+        if not preset:
+            self._warn(row, f"FX preset not found: {fx.fx_id}")
+            return []
+        fx.resolved = preset
+        items: List[dict[str, Any]] = []
+        if preset.source:
+            pack = self.data.packs.get(preset.source)
+            if pack:
+                items.extend(self._instantiate_pack(pack, row))
+            else:
+                self._warn(row, f"FX preset '{fx.fx_id}' references missing pack '{preset.source}'")
+        elif preset.asset:
+            asset_items = self._instantiate_object(
+                TimelineObject(role=preset.fx_type or "FX", identifier=preset.asset, layer=None, resolved=None),
+                row,
+            )
+            if not asset_items:
+                self._warn(row, f"FX preset '{fx.fx_id}' asset not resolved: {preset.asset}")
+            items.extend(asset_items)
+        else:
+            self._warn(row, f"FX preset '{fx.fx_id}' has no source or asset")
+
+        combined_params = self._deep_copy(preset.parameters) if preset.parameters else {}
+        if fx.parameters:
+            combined_params = self._merge_parameters(combined_params, fx.parameters)
+        if combined_params:
+            for item in items:
+                self._apply_parameters(item, combined_params)
+        return items
+
+    def _apply_parameters(self, target: dict[str, Any], overrides: Dict[str, Any]) -> None:
+        for key, value in overrides.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                self._apply_parameters(target[key], value)
+            else:
+                target[key] = value
+
+    def _merge_parameters(self, base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+        result = self._deep_copy(base) if base else {}
+        for key, value in overrides.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = self._merge_parameters(result[key], value)
+            else:
+                result[key] = value
+        return result
+
+    def _finalize_layers(self, placements: List[dict[str, Any]]) -> None:
+        bands: Dict[tuple[int, int], List[dict[str, Any]]] = {}
+        for placement in placements:
+            band = placement["band"]
+            if band is None or placement["explicit"]:
+                continue
+            key = (placement["row"].index, int(band))
+            bands.setdefault(key, []).append(placement)
+        for (row_index, band), items in bands.items():
+            items.sort(key=lambda p: p["order"])  # left -> right
+            for offset, placement in enumerate(items):
+                if offset >= self.band_width:
+                    placement["item"]["Layer"] = band + self.band_width - 1
+                    self._warn(placement["row"], f"Layer band overflow at band {band} for role '{placement['role']}'")
+                else:
+                    placement["item"]["Layer"] = band + (self.band_width - offset - 1)
+
+    def _infer_layer_band(self, role: str | None) -> int:
+        if role and (band := self.data.layers.get(role)):
+            return band.layer
+        if role:
+            if role.startswith("オブジェクト"):
+                return 60
+            if role.startswith("FX"):
+                return 50
+            if role == "背景":
+                return 10
+        if role == "テロップ":
+            return 80
+        if role == "立ち絵":
+            return 70
+        if role == "パック":
+            return 60
+        return 50
+
+    def _register_characters_from_item(self, item: dict[str, Any]) -> None:
+        char_name = item.get("CharacterName")
+        if isinstance(char_name, str):
+            self.characters_in_use.add(char_name)
+
+    def _warn_unresolved_filepaths(self, row: TimelineRow, role: str | None, item: dict[str, Any]) -> None:
+        file_path = item.get("FilePath")
+        if isinstance(file_path, str) and file_path.startswith("template://"):
+            context = f" for role '{role}'" if role else ""
+            self._warn(row, f"Unresolved template path{context}: {file_path}")
+
+    def _deep_copy(self, data: Any) -> Any:
+        return json.loads(json.dumps(data))
 
     def _warn(self, row: TimelineRow, message: str): self.warnings.append(BuildWarning(row.index, message))
 
