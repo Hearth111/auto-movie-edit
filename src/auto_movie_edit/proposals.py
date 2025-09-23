@@ -7,7 +7,10 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Tuple
+
+if TYPE_CHECKING:  # pragma: no cover - type checking only
+    from .language import LanguageAnalyzer
 
 __all__ = ["ProposalModel", "ProposalSuggestions", "update_proposal_model"]
 
@@ -141,10 +144,15 @@ class ProposalModel:
     # ------------------------------------------------------------------
     # Suggestions
     # ------------------------------------------------------------------
-    def suggest(self, subtitle: str | None, limit: int = 3) -> ProposalSuggestions:
+    def suggest(
+        self,
+        subtitle: str | None,
+        limit: int = 3,
+        analyzer: "LanguageAnalyzer" | None = None,
+    ) -> ProposalSuggestions:
         """Return ranked proposal candidates for a subtitle."""
 
-        tokens = self._tokenize(subtitle)
+        tokens = self._tokenize(subtitle, analyzer=analyzer)
         tokens.append("__global__")
         suggestions: Dict[str, List[Tuple[str, float]]] = {}
         for category in ("telop", "pack", "asset", "fx"):
@@ -273,10 +281,17 @@ class ProposalModel:
         return dt.timestamp()
 
     @staticmethod
-    def _tokenize(text: str | None) -> List[str]:
+    def _tokenize(
+        text: str | None,
+        analyzer: "LanguageAnalyzer" | None = None,
+    ) -> List[str]:
         if not text:
             return []
-        tokens = _TOKEN_PATTERN.findall(text)
+        tokens: List[str] = []
+        if analyzer is not None:
+            tokens = analyzer.tokenize(text)
+        if not tokens:
+            tokens = _TOKEN_PATTERN.findall(text)
         if not tokens:
             tokens = [text.strip()]
         return tokens

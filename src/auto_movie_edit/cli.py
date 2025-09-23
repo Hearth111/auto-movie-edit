@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, Optional
 import typer
 from openpyxl import Workbook, load_workbook
 
+from .language import LanguageAnalyzer
 from .srt import SrtParseError, parse_srt
 from .proposals import ProposalModel
 from .workbook import (
@@ -44,17 +45,23 @@ def make_sheet(
     workbook = create_workbook_template(DEFAULT_TEMPLATE)
     timeline_sheet = workbook["TIMELINE"]
 
+    language_analyzer = LanguageAnalyzer()
+    analysis = language_analyzer.analyze_subtitles([entry.text for entry in entries])
+    context_summary = ", ".join(analysis.global_keywords[:3])
+    context_written = False
+
     proposal_model: ProposalModel | None = None
     if knowledge_base and knowledge_base.exists():
         proposal_model = ProposalModel.load(knowledge_base)
 
-    for row_index, entry in enumerate(entries, start=2):
+    for row_index, (entry, insight) in enumerate(zip(entries, analysis.insights), start=2):
         timeline_sheet.cell(row=row_index, column=1, value=entry.start.to_string())
         timeline_sheet.cell(row=row_index, column=2, value=entry.end.to_string())
         timeline_sheet.cell(row=row_index, column=3, value=entry.text)
 
+        memo_segments: list[str] = []
         if proposal_model:
-            suggestions = proposal_model.suggest(entry.text)
+            suggestions = proposal_model.suggest(entry.text, analyzer=language_analyzer)
             if suggestions.has_data():
                 telops = suggestions.top("telop")
                 if telops:
@@ -65,22 +72,33 @@ def make_sheet(
                 assets = suggestions.top("asset")
                 if assets:
                     timeline_sheet.cell(row=row_index, column=10, value=assets[0])
-                memo_segments = []
+                suggestion_segments: list[str] = []
                 if telops:
-                    memo_segments.append(f"テロップ:{', '.join(telops[:3])}")
+                    suggestion_segments.append(f"テロップ:{', '.join(telops[:3])}")
                 if packs:
-                    memo_segments.append(f"パック:{', '.join(packs[:3])}")
+                    suggestion_segments.append(f"パック:{', '.join(packs[:3])}")
                 if assets:
-                    memo_segments.append(f"オブジェクト:{', '.join(assets[:3])}")
+                    suggestion_segments.append(f"オブジェクト:{', '.join(assets[:3])}")
                 fx_candidates = suggestions.top("fx", limit=3)
                 if fx_candidates:
-                    memo_segments.append(f"FX:{', '.join(fx_candidates)}")
-                if memo_segments:
-                    timeline_sheet.cell(
-                        row=row_index,
-                        column=16,
-                        value="AI候補 " + " / ".join(memo_segments),
-                    )
+                    suggestion_segments.append(f"FX:{', '.join(fx_candidates)}")
+                if suggestion_segments:
+                    memo_segments.append("AI候補 " + " / ".join(suggestion_segments))
+
+        insight_segments: list[str] = []
+        if insight.keywords:
+            insight_segments.append(f"キーワード:{', '.join(insight.keywords)}")
+        if insight.emphasis:
+            insight_segments.append(f"トーン:{insight.emphasis}")
+        if insight_segments:
+            memo_segments.append("AI解析 " + " / ".join(insight_segments))
+
+        if context_summary and not context_written:
+            memo_segments.append(f"全体トピック:{context_summary}")
+            context_written = True
+
+        if memo_segments:
+            timeline_sheet.cell(row=row_index, column=16, value=" | ".join(memo_segments))
 
     save_workbook(workbook, out)
     typer.secho(f"Workbook created: {out}", fg=typer.colors.GREEN)
