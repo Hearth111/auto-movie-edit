@@ -88,69 +88,190 @@ def load_sheet_dictionaries(sheet) -> list[dict[str, Any]]:
         for row in sheet.iter_rows(min_row=2, values_only=True)
     ]
 
+def _split_schema_columns(raw_value: Any, fallback: str | None) -> List[str]:
+    columns: List[str] = []
+    if isinstance(raw_value, str):
+        normalized = raw_value.replace(";", ",").replace("|", ",")
+        columns = [chunk.strip() for chunk in normalized.split(",") if chunk.strip()]
+    elif raw_value not in (None, ""):
+        columns = [str(raw_value).strip()]
+    if not columns and fallback:
+        columns = [fallback]
+    return columns
+
+def _schema_columns(schema: Dict[str, List[str]], key: str, fallback: str | None) -> List[str]:
+    columns = schema.get(key)
+    if columns:
+        return columns
+    return [fallback] if fallback else []
+
+def _single_column(schema: Dict[str, List[str]], key: str, fallback: str | None) -> str | None:
+    columns = _schema_columns(schema, key, fallback)
+    return columns[0] if columns else None
+
+def _collect_schema_columns(schema: Dict[str, List[str]], prefix: str) -> List[str]:
+    collected: List[tuple[str, List[str]]] = [
+        (key, cols)
+        for key, cols in schema.items()
+        if key.startswith(prefix) and cols
+    ]
+    collected.sort(key=lambda item: item[0])
+    result: List[str] = []
+    seen: set[str] = set()
+    for _, columns in collected:
+        for column in columns:
+            if column in seen:
+                continue
+            seen.add(column)
+            result.append(column)
+    return result
+
+def _schema_column_key_map(schema: Dict[str, List[str]]) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for key, columns in schema.items():
+        for column in columns:
+            mapping[column] = key
+    return mapping
+
+def _row_value(row: Dict[str, Any], schema: Dict[str, List[str]], key: str, fallback: str | None) -> Any:
+    for column in _schema_columns(schema, key, fallback):
+        if column in row:
+            return row.get(column)
+    return None
+
+def _first_nonempty(row: Dict[str, Any], columns: List[str]) -> Any:
+    for column in columns:
+        value = row.get(column)
+        if value not in (None, ""):
+            return value
+    return None
+
+def _resolve_role_name(column: str, canonical_key: str | None) -> str:
+    if not canonical_key:
+        return column
+    if canonical_key.startswith("object."):
+        suffix = canonical_key.split(".", 1)[1]
+        return suffix or column
+    return canonical_key
+
+def _resolve_layer_band(layers: Dict[str, LayerBand], column: str, canonical_key: str | None, role_name: str) -> int | None:
+    candidates = []
+    if canonical_key:
+        if canonical_key.startswith("object."):
+            candidates.append(role_name)
+        else:
+            candidates.append(canonical_key)
+    candidates.append(role_name)
+    candidates.append(column)
+    for key in candidates:
+        layer = layers.get(key)
+        if layer:
+            return layer.layer
+    return None
+
 def load_workbook_data(path: str | Path) -> WorkbookData:
     path = Path(path).resolve()
     wb = load_workbook(path, data_only=True)
     data = WorkbookData()
 
-    # Load all dictionaries first
+    # Schema map must be loaded first so that column lookups can be resolved.
+    if "SCHEMA_MAP" in wb.sheetnames:
+        for row in iter_nonempty(load_sheet_dictionaries(wb["SCHEMA_MAP"])):
+            sheet_name = _string_or_none(row.get("シート"))
+            key = _string_or_none(row.get("キー"))
+            columns = _split_schema_columns(row.get("日本語"), key)
+            if not sheet_name or not key or not columns:
+                continue
+            sheet_map = data.schema_map.setdefault(sheet_name, {})
+            sheet_map[key] = columns
+
+    # Load all dictionaries using the resolved schema map
+    telp_schema = data.schema_map.get("TELP_PATTERNS", {})
+    asset_schema = data.schema_map.get("ASSETS_SINGLE", {})
+    pack_schema = data.schema_map.get("PACKS_MULTI", {})
+    layer_schema = data.schema_map.get("LAYERS", {})
+    fx_schema = data.schema_map.get("FX", {})
+    character_schema = data.schema_map.get("CHARACTERS", {})
+
     if "TELP_PATTERNS" in wb.sheetnames:
         for r in iter_nonempty(load_sheet_dictionaries(wb["TELP_PATTERNS"])):
-            if id := str(r.get("パターンID") or "").strip():
-                data.telop_patterns[id] = TelopPattern(
-                    pattern_id=id,
-                    source=_string_or_none(r.get("参照ソース")),
-                    overrides=parse_mapping(r.get("上書きキー")),
-                    base_width=_safe_int(r.get("基準幅")),
-                    base_height=_safe_int(r.get("基準高さ")),
-                    fps=_safe_float(r.get("FPS")),
-                    description=_string_or_none(r.get("説明")),
-                    notes=_string_or_none(r.get("備考")),
-                )
+            pattern_id = _string_or_none(_row_value(r, telp_schema, "pattern_id", "パターンID"))
+            if not pattern_id:
+                continue
+            data.telop_patterns[pattern_id] = TelopPattern(
+                pattern_id=pattern_id,
+                source=_string_or_none(_row_value(r, telp_schema, "source", "参照ソース")),
+                overrides=parse_mapping(_row_value(r, telp_schema, "overrides", "上書きキー")),
+                base_width=_safe_int(_row_value(r, telp_schema, "base_width", "基準幅")),
+                base_height=_safe_int(_row_value(r, telp_schema, "base_height", "基準高さ")),
+                fps=_safe_float(_row_value(r, telp_schema, "fps", "FPS")),
+                description=_string_or_none(_row_value(r, telp_schema, "description", "説明")),
+                notes=_string_or_none(_row_value(r, telp_schema, "notes", "備考")),
+            )
+
     if "ASSETS_SINGLE" in wb.sheetnames:
         for r in iter_nonempty(load_sheet_dictionaries(wb["ASSETS_SINGLE"])):
-            if id := str(r.get("素材ID") or "").strip():
-                data.assets[id] = Asset(
-                    asset_id=id,
-                    kind=_string_or_none(r.get("種別")),
-                    path=_string_or_none(r.get("パス")),
-                    parameters=parse_mapping(r.get("パラメータ")) if "パラメータ" in r else {},
-                    default_layer=_safe_int(r.get("既定レイヤ")),
-                    default_x=_safe_float(r.get("既定X")),
-                    default_y=_safe_float(r.get("既定Y")),
-                    default_zoom=_safe_float(r.get("既定ズーム")),
-                    notes=_string_or_none(r.get("備考")),
-                )
+            asset_id = _string_or_none(_row_value(r, asset_schema, "asset_id", "素材ID"))
+            if not asset_id:
+                continue
+            parameters_raw = _row_value(r, asset_schema, "parameters", "パラメータ")
+            data.assets[asset_id] = Asset(
+                asset_id=asset_id,
+                kind=_string_or_none(_row_value(r, asset_schema, "kind", "種別")),
+                path=_string_or_none(_row_value(r, asset_schema, "path", "パス")),
+                parameters=parse_mapping(parameters_raw) if parameters_raw is not None else {},
+                default_layer=_safe_int(_row_value(r, asset_schema, "default_layer", "既定レイヤ")),
+                default_x=_safe_float(_row_value(r, asset_schema, "default_x", "既定X")),
+                default_y=_safe_float(_row_value(r, asset_schema, "default_y", "既定Y")),
+                default_zoom=_safe_float(_row_value(r, asset_schema, "default_zoom", "既定ズーム")),
+                notes=_string_or_none(_row_value(r, asset_schema, "notes", "備考")),
+            )
+
     if "CHARACTERS" in wb.sheetnames:
         for r in iter_nonempty(load_sheet_dictionaries(wb["CHARACTERS"])):
-            if (name := _string_or_none(r.get("キャラクター名"))) and (part := _string_or_none(r.get("パーツ名"))) and (bp := _string_or_none(r.get("ベースパス"))):
-                if name not in data.characters: data.characters[name] = Character(name=name)
-                data.characters[name].parts[part] = bp
+            name = _string_or_none(_row_value(r, character_schema, "name", "キャラクター名"))
+            part = _string_or_none(_row_value(r, character_schema, "part", "パーツ名"))
+            base_path = _string_or_none(_row_value(r, character_schema, "base_path", "ベースパス"))
+            if not (name and part and base_path):
+                continue
+            if name not in data.characters:
+                data.characters[name] = Character(name=name)
+            data.characters[name].parts[part] = base_path
+
     if "LAYERS" in wb.sheetnames:
         for r in iter_nonempty(load_sheet_dictionaries(wb["LAYERS"])):
-            if (role := str(r.get("役割") or "").strip()) and (layer := _safe_int(r.get("レイヤ帯"))) is not None: data.layers[role] = LayerBand(role=role, layer=layer)
+            role = _string_or_none(_row_value(r, layer_schema, "role", "役割"))
+            layer = _safe_int(_row_value(r, layer_schema, "layer", "レイヤ帯"))
+            if role and layer is not None:
+                data.layers[role] = LayerBand(role=role, layer=layer)
+
     if "PACKS_MULTI" in wb.sheetnames:
         for r in iter_nonempty(load_sheet_dictionaries(wb["PACKS_MULTI"])):
-            if id := str(r.get("パックID") or "").strip():
-                data.packs[id] = Pack(
-                    pack_id=id,
-                    source=_string_or_none(r.get("参照ソース")),
-                    overrides=parse_mapping(r.get("上書きキー")),
-                    base_width=_safe_int(r.get("基準幅")),
-                    base_height=_safe_int(r.get("基準高さ")),
-                    fps=_safe_float(r.get("FPS")),
-                    notes=_string_or_none(r.get("備考")),
-                )
+            pack_id = _string_or_none(_row_value(r, pack_schema, "pack_id", "パックID"))
+            if not pack_id:
+                continue
+            data.packs[pack_id] = Pack(
+                pack_id=pack_id,
+                source=_string_or_none(_row_value(r, pack_schema, "source", "参照ソース")),
+                overrides=parse_mapping(_row_value(r, pack_schema, "overrides", "上書きキー")),
+                base_width=_safe_int(_row_value(r, pack_schema, "base_width", "基準幅")),
+                base_height=_safe_int(_row_value(r, pack_schema, "base_height", "基準高さ")),
+                fps=_safe_float(_row_value(r, pack_schema, "fps", "FPS")),
+                notes=_string_or_none(_row_value(r, pack_schema, "notes", "備考")),
+            )
+
     if "FX" in wb.sheetnames:
         for r in iter_nonempty(load_sheet_dictionaries(wb["FX"])):
-            if id := str(r.get("FX_ID") or "").strip():
-                data.fx_presets[id] = FxPreset(
-                    fx_id=id,
-                    fx_type=_string_or_none(r.get("種類")),
-                    source=_string_or_none(r.get("パック")),
-                    asset=_string_or_none(r.get("アセット")),
-                    parameters=parse_mapping(r.get("パラメータ")),
-                )
+            fx_id = _string_or_none(_row_value(r, fx_schema, "fx_id", "FX_ID"))
+            if not fx_id:
+                continue
+            data.fx_presets[fx_id] = FxPreset(
+                fx_id=fx_id,
+                fx_type=_string_or_none(_row_value(r, fx_schema, "type", "種類")),
+                source=_string_or_none(_row_value(r, fx_schema, "pack", "パック")),
+                asset=_string_or_none(_row_value(r, fx_schema, "asset", "アセット")),
+                parameters=parse_mapping(_row_value(r, fx_schema, "parameters", "パラメータ")),
+            )
 
     # Resolve template paths for telops and assets
     for p in data.telop_patterns.values():
@@ -163,44 +284,77 @@ def load_workbook_data(path: str | Path) -> WorkbookData:
     # Timeline
     if "TIMELINE" in wb.sheetnames:
         records = load_sheet_dictionaries(wb["TIMELINE"])
+        timeline_schema = data.schema_map.get("TIMELINE", {})
         if records:
             keys = records[0].keys()
-            obj_cols = [k for k in keys if k and (k.startswith("オブジェクト") or k == "背景")]
-            expr_cols = {"表情(3つ内包)": ["目", "口", "眉"], "表情": ["顔色"], "他1": ["他1"]}
-            fx_cols = [k for k in keys if k and k.startswith("FX") and k != "FX_PARAM"]
+            column_key_map = _schema_column_key_map(timeline_schema)
+            object_columns = _collect_schema_columns(timeline_schema, "object.")
+            if not object_columns:
+                object_columns = [k for k in keys if k and (k.startswith("オブジェクト") or k == "背景")]
+            fx_columns = _collect_schema_columns(timeline_schema, "fx.")
+            if not fx_columns:
+                fx_columns = [k for k in keys if k and k.startswith("FX") and k != "FX_PARAM"]
+            expr_config = {
+                _single_column(timeline_schema, "expressions.primary", "表情(3つ内包)"): ["目", "口", "眉"],
+                _single_column(timeline_schema, "expressions.face", "表情"): ["顔色"],
+                _single_column(timeline_schema, "expressions.extra", "他1"): ["他1"],
+            }
+            expr_cols = {col: parts for col, parts in expr_config.items() if col}
+            pack_columns = _schema_columns(timeline_schema, "packs", "パック")
+            fx_param_columns = _schema_columns(timeline_schema, "fx.params", "FX_PARAM")
+            approval_columns = _schema_columns(timeline_schema, "approval", "承認")
+            memo_columns = _schema_columns(timeline_schema, "memo", "メモ")
+            start_columns = _schema_columns(timeline_schema, "start", "開始")
+            end_columns = _schema_columns(timeline_schema, "end", "終了")
+            subtitle_columns = _schema_columns(timeline_schema, "subtitle", "字幕テキスト")
+            telop_columns = _schema_columns(timeline_schema, "telop", "テロップ")
+            character_columns = _schema_columns(timeline_schema, "character", "キャラクター")
+
             for i, r in enumerate(iter_nonempty(records), 1):
                 expr = {
                     part: filename
                     for column, parts in expr_cols.items()
-                    if (filename := _string_or_none(r.get(column)))
+                    if column and (filename := _string_or_none(r.get(column)))
                     for part in parts
                 }
-                objs = [
-                    TimelineObject(
-                        role=column,
-                        identifier=identifier,
-                        layer=data.layers.get(column).layer if data.layers.get(column) else None,
+                objs = []
+                for column in object_columns:
+                    identifier = _string_or_none(r.get(column))
+                    if not identifier:
+                        continue
+                    canonical_key = column_key_map.get(column)
+                    role_name = _resolve_role_name(column, canonical_key)
+                    layer_band = _resolve_layer_band(data.layers, column, canonical_key, role_name)
+                    objs.append(
+                        TimelineObject(
+                            role=role_name,
+                            identifier=identifier,
+                            layer=layer_band,
+                            source_column=column,
+                        )
                     )
-                    for column in obj_cols
-                    if (identifier := _string_or_none(r.get(column)))
-                ]
-                packs = [
-                    _normalize_identifier(value)
-                    for value in ensure_list(r.get("パック"))
-                    if _normalize_identifier(value)
-                ]
-                fx_values = {
-                    column: [
+
+                packs: List[str] = []
+                for column in pack_columns:
+                    packs.extend(
+                        filter(
+                            None,
+                            (_normalize_identifier(value) for value in ensure_list(r.get(column))),
+                        )
+                    )
+
+                fx_values: Dict[str, List[str]] = {}
+                for column in fx_columns:
+                    fx_values[column] = [
                         _normalize_identifier(value)
                         for value in ensure_list(r.get(column))
                         if _normalize_identifier(value)
                     ]
-                    for column in fx_cols
-                }
+
                 total_fx = sum(len(values) for values in fx_values.values())
-                fx_param_raw = _parse_fx_params(r.get("FX_PARAM"))
+                fx_param_raw = _parse_fx_params(_first_nonempty(r, fx_param_columns))
                 fxs: List[TimelineFx] = []
-                for column_index, column in enumerate(fx_cols):
+                for column_index, column in enumerate(fx_columns):
                     values = fx_values.get(column, [])
                     for fx_id in values:
                         params = _select_fx_parameters(fx_param_raw, fx_id, column, total_fx)
@@ -209,29 +363,31 @@ def load_workbook_data(path: str | Path) -> WorkbookData:
                                 fx_id=fx_id,
                                 parameters=params,
                                 source_column=column,
+                                source_key=column_key_map.get(column),
                                 column_index=column_index,
                             )
                         )
+
                 notes: Dict[str, Any] = {}
                 if fx_param_raw not in (None, {}):
                     notes["fx_params"] = fx_param_raw
-                if approval := _string_or_none(r.get("承認")):
+                if approval := _string_or_none(_first_nonempty(r, approval_columns)):
                     notes["approval"] = approval
-                if memo := _string_or_none(r.get("メモ")):
+                if memo := _string_or_none(_first_nonempty(r, memo_columns)):
                     notes["memo"] = memo
 
                 data.timeline.append(
                     TimelineRow(
                         index=i,
-                        start=parse_timecode(_string_or_none(r.get("開始"))),
-                        end=parse_timecode(_string_or_none(r.get("終了"))),
-                        subtitle=_string_or_none(r.get("字幕テキスト")),
-                        telop=_string_or_none(r.get("テロップ")),
-                        character=_string_or_none(r.get("キャラクター")),
+                        start=parse_timecode(_string_or_none(_first_nonempty(r, start_columns))),
+                        end=parse_timecode(_string_or_none(_first_nonempty(r, end_columns))),
+                        subtitle=_string_or_none(_first_nonempty(r, subtitle_columns)),
+                        telop=_string_or_none(_first_nonempty(r, telop_columns)),
+                        character=_string_or_none(_first_nonempty(r, character_columns)),
                         expressions=expr,
                         objects=objs,
                         fxs=fxs,
-                        packs=packs,
+                        packs=[p for p in packs if p],
                         notes=notes,
                     )
                 )

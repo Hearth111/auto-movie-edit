@@ -53,8 +53,8 @@ def build(
 ) -> None:
     """Build a simplified YMMP project from the workbook."""
     data = load_workbook_data(sheet)
-    project, warnings = build_project(data)
-    write_outputs(project, warnings, out)
+    project, warnings, history = build_project(data)
+    write_outputs(project, warnings, out, history)
     typer.secho(f"Project generated with {len(warnings)} warnings -> {out}", fg=typer.colors.GREEN)
 
 
