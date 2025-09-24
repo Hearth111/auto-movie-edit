@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import copy
+import hashlib
 import json
 from pathlib import Path
 from collections.abc import Mapping, Sequence
@@ -20,6 +21,20 @@ from .models import (
 )
 from .proposals import update_proposal_model
 from .utils import dump_json, contains_hiragana, ensure_list
+
+
+_SCAFFOLD_CACHE: Dict[Path, tuple[float, int, dict[str, Any]]] = {}
+
+
+def _load_scaffold_project(scaffold_path: Path) -> dict[str, Any]:
+    resolved = scaffold_path.resolve()
+    stat = resolved.stat()
+    cached = _SCAFFOLD_CACHE.get(resolved)
+    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return copy.deepcopy(cached[2])
+    project = json.loads(resolved.read_text("utf-8-sig"))
+    _SCAFFOLD_CACHE[resolved] = (stat.st_mtime, stat.st_size, project)
+    return copy.deepcopy(project)
 
 class BuildWarning:
     """Represents a warning produced during project build."""
@@ -40,7 +55,7 @@ class ProjectBuilder:
         self.language_analyzer = LanguageAnalyzer()
         self.expression_presets_by_tone: Dict[str, List[ExpressionPreset]] = {}
         self.default_expression_presets: List[ExpressionPreset] = []
-        self._template_cache: Dict[int, tuple[Mapping[str, Any], Tuple[tuple[str, Any], ...]]] = {}
+        self._template_cache: Dict[tuple[str, Any], tuple[Mapping[str, Any], Tuple[tuple[str, Any], ...]]] = {}
         for preset in self.data.expression_presets.values():
             if not preset.tones:
                 self.default_expression_presets.append(preset)
@@ -65,7 +80,7 @@ class ProjectBuilder:
     def build(self) -> dict[str, Any]:
         """Builds the final YMM4 project by injecting items and characters into a scaffold file."""
         if not self.scaffold_path.exists(): raise FileNotFoundError(f"Scaffold file not found: '{self.scaffold_path}'")
-        project = json.loads(self.scaffold_path.read_text("utf-8-sig"))
+        project = _load_scaffold_project(self.scaffold_path)
 
         timeline_items: List[dict[str, Any]] = []
         for row in self.data.timeline:
@@ -495,12 +510,26 @@ class ProjectBuilder:
             raise TypeError("Template data must be a dictionary.")
         return template
 
+    def _digest_template(self, template: Mapping[str, Any]) -> str | None:
+        try:
+            serialized = json.dumps(template, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None
+        return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
+
     def _clone_template(self, template: Mapping[str, Any]) -> dict[str, Any]:
-        cache_key = id(template)
-        cached = self._template_cache.get(cache_key)
+        identity_key = ("id", id(template))
+        cached = self._template_cache.get(identity_key)
         if not cached or cached[0] is not template:
-            cached = (template, tuple(template.items()))
-            self._template_cache[cache_key] = cached
+            digest = self._digest_template(template)
+            digest_key = ("digest", digest) if digest else None
+            if digest_key:
+                cached = self._template_cache.get(digest_key)
+            items = cached[1] if cached else tuple(template.items())
+            cached = (template, items)
+            self._template_cache[identity_key] = cached
+            if digest_key:
+                self._template_cache[digest_key] = cached
         _, items = cached
         cloned: dict[str, Any] = {}
         for key, value in items:
