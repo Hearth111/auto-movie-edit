@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from itertools import chain
+from typing import Any, Dict, Iterable, Iterator, List
 
 from openpyxl import Workbook, load_workbook
 
@@ -96,13 +97,12 @@ def save_workbook(workbook: Workbook, path: str | Path) -> None:
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(path)
 
-def load_sheet_dictionaries(sheet) -> list[dict[str, Any]]:
-    if not sheet or sheet.max_row < 1: return []
+def load_sheet_dictionaries(sheet) -> Iterator[dict[str, Any]]:
+    if not sheet or sheet.max_row < 1:
+        return
     headers = [(cell.value or "").strip() for cell in sheet[1]]
-    return [
-        {h: row[i] for i, h in enumerate(headers) if h}
-        for row in sheet.iter_rows(min_row=2, values_only=True)
-    ]
+    for row in sheet.iter_rows(min_row=2, values_only=True):
+        yield {h: row[i] for i, h in enumerate(headers) if h}
 
 def _split_schema_columns(raw_value: Any, fallback: str | None) -> List[str]:
     columns: List[str] = []
@@ -345,10 +345,11 @@ def load_workbook_data(path: str | Path) -> WorkbookData:
 
     # Timeline
     if "TIMELINE" in wb.sheetnames:
-        records = load_sheet_dictionaries(wb["TIMELINE"])
+        timeline_rows = load_sheet_dictionaries(wb["TIMELINE"])
+        first_record = next(timeline_rows, None)
         timeline_schema = data.schema_map.get("TIMELINE", {})
-        if records:
-            keys = records[0].keys()
+        if first_record:
+            keys = first_record.keys()
             column_key_map = _schema_column_key_map(timeline_schema)
             object_columns = _collect_schema_columns(timeline_schema, "object.")
             if not object_columns:
@@ -372,7 +373,8 @@ def load_workbook_data(path: str | Path) -> WorkbookData:
             telop_columns = _schema_columns(timeline_schema, "telop", "テロップ")
             character_columns = _schema_columns(timeline_schema, "character", "キャラクター")
 
-            for i, r in enumerate(iter_nonempty(records), 1):
+            data_rows = iter_nonempty(chain([first_record], timeline_rows))
+            for i, r in enumerate(data_rows, 1):
                 expr: Dict[str, str] = {}
                 expr_note_presets: List[str] = []
                 expr_note_tones: List[str] = []
