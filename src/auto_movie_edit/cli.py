@@ -234,8 +234,12 @@ def _extract_telops_from_raw_ymmp(project: dict, xlsx_path: Path) -> dict:
             pattern_id = f"telop_{text}"
             if pattern_id in extracted: continue
 
+            sanitized = _strip_runtime_fields(item, {"Layer"})
             template_file_path = template_dir / f"{pattern_id}.json"
-            template_file_path.write_text(json.dumps(item, ensure_ascii=False, indent=2), encoding="utf-8")
+            template_file_path.write_text(
+                json.dumps(sanitized, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
             extracted[pattern_id] = {
                 "pattern_id": pattern_id,
@@ -272,8 +276,12 @@ def _extract_assets_from_raw_ymmp(project: dict, xlsx_path: Path) -> dict:
             asset_id = f"image_{file_path.stem}"
 
         if asset_id and asset_id not in extracted:
+            sanitized = _strip_runtime_fields(item, {"Layer"})
             template_file_path = template_dir / f"{asset_id}.json"
-            template_file_path.write_text(json.dumps(item, ensure_ascii=False, indent=2), encoding="utf-8")
+            template_file_path.write_text(
+                json.dumps(sanitized, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
             
             extracted[asset_id] = {
                 "asset_id": asset_id,
@@ -517,15 +525,18 @@ def _safe_filename(identifier: str) -> str:
     return sanitized or "template"
 
 
-def _strip_runtime_fields(data: Any) -> Any:
+def _strip_runtime_fields(data: Any, extra_keys: set[str] | None = None) -> Any:
+    keys_to_remove = {"Frame", "Length"}
+    if extra_keys:
+        keys_to_remove = keys_to_remove.union(extra_keys)
     if isinstance(data, dict):
         return {
-            key: _strip_runtime_fields(value)
+            key: _strip_runtime_fields(value, extra_keys)
             for key, value in data.items()
-            if key not in {"Frame", "Length"}
+            if key not in keys_to_remove
         }
     if isinstance(data, list):
-        return [_strip_runtime_fields(item) for item in data]
+        return [_strip_runtime_fields(item, extra_keys) for item in data]
     return data
 
 

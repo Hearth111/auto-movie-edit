@@ -284,10 +284,13 @@ class ProjectBuilder:
             raise TypeError("Template data must be a dictionary.")
         item = self._deep_copy(template)
         if row.start:
-            item.setdefault("Frame", int(row.start.to_seconds() * self.fps))
+            frame_value = int(row.start.to_seconds() * self.fps)
+            item["Frame"] = frame_value
         if row.start and row.end:
-            length = int(max(0, row.end.to_seconds() - row.start.to_seconds()) * self.fps)
-            item.setdefault("Length", length)
+            start_seconds = row.start.to_seconds()
+            end_seconds = row.end.to_seconds()
+            length_seconds = max(0.0, end_seconds - start_seconds)
+            item["Length"] = int(length_seconds * self.fps)
         return item
 
     def _instantiate_object(self, obj: TimelineObject, row: TimelineRow) -> List[dict[str, Any]]:
