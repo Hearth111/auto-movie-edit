@@ -56,6 +56,17 @@ class Character:
     name: str
     parts: Dict[str, str] = field(default_factory=dict)  # part_name -> base_path
 
+
+@dataclass(slots=True)
+class ExpressionPreset:
+    """Represents a reusable combination of expression parts."""
+
+    preset_id: str
+    character: Optional[str] = None
+    tones: List[str] = field(default_factory=list)
+    parts: Dict[str, str] = field(default_factory=dict)
+    notes: Optional[str] = None
+
 @dataclass(slots=True)
 class LayerBand:
     """Represents mapping from a role to a layer band."""
@@ -100,11 +111,13 @@ class TimelineRow:
 @dataclass(slots=True)
 class WorkbookData:
     """Container for all information extracted from the workbook."""
+
     telop_patterns: Dict[str, TelopPattern] = field(default_factory=dict)
     assets: Dict[str, Asset] = field(default_factory=dict)
     packs: Dict[str, Pack] = field(default_factory=dict)
     fx_presets: Dict[str, FxPreset] = field(default_factory=dict)
     characters: Dict[str, Character] = field(default_factory=dict)
+    expression_presets: Dict[str, ExpressionPreset] = field(default_factory=dict)
     layers: Dict[str, LayerBand] = field(default_factory=dict)
     timeline: List[TimelineRow] = field(default_factory=list)
     schema_map: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
