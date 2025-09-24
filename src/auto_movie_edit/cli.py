@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import typer
 from openpyxl import Workbook, load_workbook
 
+from .history import load_history_entries, summarize_warnings
 from .language import LanguageAnalyzer
 from .srt import SrtParseError, parse_srt
 from .proposals import ProposalModel
@@ -171,6 +172,53 @@ def filter_command(
         typer.secho(f"Unknown filter: {filter_name}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
 
+
+@app.command("history-feedback")
+def history_feedback(
+    history_path: Path = typer.Option(
+        Path("work/history"),
+        exists=False,
+        file_okay=True,
+        dir_okay=True,
+        help="history.jsonl が保存されるディレクトリまたはファイル",
+    ),
+    latest_only: bool = typer.Option(
+        True,
+        help="最新の history.jsonl のみを対象に集計する",
+    ),
+    row_limit: int = typer.Option(
+        5,
+        help="各警告で表示する行番号の上限",
+    ),
+) -> None:
+    """Collect warnings from history.jsonl files and provide remediation hints."""
+
+    result = load_history_entries(history_path, latest_only=latest_only)
+    if result.errors:
+        for error in result.errors:
+            typer.secho(error, fg=typer.colors.YELLOW)
+
+    if not result.entries:
+        typer.secho("履歴エントリが見つかりません。history.jsonl を生成してから実行してください。", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    summaries = summarize_warnings(result.entries)
+    if not summaries:
+        typer.secho("警告は記録されていません。", fg=typer.colors.GREEN)
+        return
+
+    typer.secho("=== 警告サマリ ===", fg=typer.colors.CYAN)
+    for item in summaries:
+        typer.secho(f"- {item['label']} : {item['count']}件", fg=typer.colors.MAGENTA)
+        if item["rows"]:
+            rows = ", ".join(str(r) for r in item["rows"][:row_limit])
+            if len(item["rows"]) > row_limit:
+                rows += ", ..."
+            typer.echo(f"  行番号例: {rows}")
+        typer.echo(f"  ヒント: {item['hint']}")
+        if item["messages"]:
+            sample = item["messages"][0]
+            typer.echo(f"  代表メッセージ: {sample}")
 
 def _extract_telops_from_raw_ymmp(project: dict, xlsx_path: Path) -> dict:
     """Extracts TextItems and saves them as templates."""
