@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Set, Tuple
 from datetime import datetime
 
@@ -39,6 +40,7 @@ class ProjectBuilder:
         self.language_analyzer = LanguageAnalyzer()
         self.expression_presets_by_tone: Dict[str, List[ExpressionPreset]] = {}
         self.default_expression_presets: List[ExpressionPreset] = []
+        self._template_cache: Dict[int, tuple[Mapping[str, Any], Tuple[tuple[str, Any], ...]]] = {}
         for preset in self.data.expression_presets.values():
             if not preset.tones:
                 self.default_expression_presets.append(preset)
@@ -274,15 +276,8 @@ class ProjectBuilder:
         return [p["item"] for p in placements]
 
     def _create_item_from_template(self, template: dict | list | None, row: TimelineRow) -> dict:
-        if template is None:
-            raise TypeError("Template data is missing.")
-        if isinstance(template, list):
-            if not template:
-                raise ValueError("Template list is empty.")
-            template = template[0]
-        if not isinstance(template, dict):
-            raise TypeError("Template data must be a dictionary.")
-        item = self._deep_copy(template)
+        resolved_template = self._resolve_template_dict(template)
+        item = self._clone_template(resolved_template)
         if row.start:
             frame_value = int(row.start.to_seconds() * self.fps)
             item["Frame"] = frame_value
@@ -422,18 +417,22 @@ class ProjectBuilder:
 
     def _apply_parameters(self, target: dict[str, Any], overrides: Dict[str, Any]) -> None:
         for key, value in overrides.items():
-            if isinstance(value, dict) and isinstance(target.get(key), dict):
-                self._apply_parameters(target[key], value)
+            if isinstance(value, Mapping) and isinstance(target.get(key), Mapping):
+                nested = dict(target[key])
+                target[key] = nested
+                self._apply_parameters(nested, value)
+            elif isinstance(value, Mapping):
+                target[key] = self._clone_parameter_value(value)
             else:
-                target[key] = value
+                target[key] = self._clone_parameter_value(value)
 
     def _merge_parameters(self, base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
-        result = self._deep_copy(base) if base else {}
+        result = self._clone_parameter_value(base) if base else {}
         for key, value in overrides.items():
             if key in result and isinstance(result[key], dict) and isinstance(value, dict):
                 result[key] = self._merge_parameters(result[key], value)
             else:
-                result[key] = value
+                result[key] = self._clone_parameter_value(value)
         return result
 
     def _finalize_layers(self, placements: List[dict[str, Any]]) -> None:
@@ -481,6 +480,44 @@ class ProjectBuilder:
         if isinstance(file_path, str) and file_path.startswith("template://"):
             context = f" for role '{role}'" if role else ""
             self._warn(row, f"Unresolved template path{context}: {file_path}")
+
+    def _resolve_template_dict(self, template: dict | list | None) -> Mapping[str, Any]:
+        if template is None:
+            raise TypeError("Template data is missing.")
+        if isinstance(template, Sequence) and not isinstance(template, (str, bytes, bytearray, Mapping)):
+            if not template:
+                raise ValueError("Template list is empty.")
+            first = template[0]
+            if not isinstance(first, Mapping):
+                raise TypeError("Template data must be a dictionary.")
+            return first
+        if not isinstance(template, Mapping):
+            raise TypeError("Template data must be a dictionary.")
+        return template
+
+    def _clone_template(self, template: Mapping[str, Any]) -> dict[str, Any]:
+        cache_key = id(template)
+        cached = self._template_cache.get(cache_key)
+        if not cached or cached[0] is not template:
+            cached = (template, tuple(template.items()))
+            self._template_cache[cache_key] = cached
+        _, items = cached
+        cloned: dict[str, Any] = {}
+        for key, value in items:
+            if isinstance(value, Mapping):
+                cloned[key] = dict(value)
+            elif isinstance(value, list):
+                cloned[key] = list(value)
+            else:
+                cloned[key] = value
+        return cloned
+
+    def _clone_parameter_value(self, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {k: self._clone_parameter_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._clone_parameter_value(v) for v in value]
+        return value
 
     def _deep_copy(self, data: Any) -> Any:
         return copy.deepcopy(data)
