@@ -118,6 +118,11 @@ class LanguageAnalyzer:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def detect_tone(self, text: str | None) -> str | None:
+        """Public wrapper for tone detection used by other modules."""
+
+        return self._detect_emphasis(text)
+
     def _ensure_tagger(self) -> None:
         if self._tagger or self._tagger_error is not None:
             return

@@ -12,6 +12,7 @@ from openpyxl import Workbook, load_workbook
 from .models import (
     Asset,
     Character,
+    ExpressionPreset,
     FxPreset,
     LayerBand,
     Pack,
@@ -45,18 +46,32 @@ TIMELINE_HEADERS = [
 ]
 SCHEMA_HEADERS = ["シート", "日本語", "キー"]
 CHARACTERS_HEADERS = ["キャラクター名", "パーツ名", "ベースパス"]
+EXPR_PRESET_HEADERS = [
+    "プリセットID", "トーン", "キャラクター", "目", "眉", "口", "顔色", "他1", "他2", "他3", "備考",
+]
+
+EXPR_PART_SCHEMA = [
+    ("parts.eye", "目"),
+    ("parts.eyebrow", "眉"),
+    ("parts.mouth", "口"),
+    ("parts.complexion", "顔色"),
+    ("parts.extra1", "他1"),
+    ("parts.extra2", "他2"),
+    ("parts.extra3", "他3"),
+]
 
 
 @dataclass(slots=True)
 class WorkbookTemplate:
     telp_headers: List[str]; asset_headers: List[str]; pack_headers: List[str]
     layer_headers: List[str]; fx_headers: List[str]; timeline_headers: List[str]
-    schema_headers: List[str]; characters_headers: List[str]
+    schema_headers: List[str]; characters_headers: List[str]; expression_headers: List[str]
 
 DEFAULT_TEMPLATE = WorkbookTemplate(
     telp_headers=TELP_HEADERS, asset_headers=ASSET_HEADERS, pack_headers=PACK_HEADERS,
     layer_headers=LAYER_HEADERS, fx_headers=FX_HEADERS, timeline_headers=TIMELINE_HEADERS,
     schema_headers=SCHEMA_HEADERS, characters_headers=CHARACTERS_HEADERS,
+    expression_headers=EXPR_PRESET_HEADERS,
 )
 
 
@@ -74,6 +89,7 @@ def create_workbook_template(template: WorkbookTemplate = DEFAULT_TEMPLATE) -> W
     _write_headers(wb.create_sheet("TIMELINE"), template.timeline_headers)
     _write_headers(wb.create_sheet("SCHEMA_MAP"), template.schema_headers)
     _write_headers(wb.create_sheet("CHARACTERS"), template.characters_headers)
+    _write_headers(wb.create_sheet("EXPRESSION_PRESETS"), template.expression_headers)
     return wb
 
 def save_workbook(workbook: Workbook, path: str | Path) -> None:
@@ -104,6 +120,29 @@ def _schema_columns(schema: Dict[str, List[str]], key: str, fallback: str | None
     if columns:
         return columns
     return [fallback] if fallback else []
+
+
+def _split_tokens(raw_value: Any) -> List[str]:
+    if raw_value in (None, ""):
+        return []
+    if isinstance(raw_value, (list, tuple, set)):
+        return [
+            str(value).strip()
+            for value in raw_value
+            if str(value).strip()
+        ]
+    if isinstance(raw_value, str):
+        normalized = (
+            raw_value
+            .replace(";", ",")
+            .replace("|", ",")
+            .replace("｜", ",")
+            .replace("；", ",")
+            .replace("，", ",")
+        )
+        return [chunk.strip() for chunk in normalized.split(",") if chunk.strip()]
+    text = str(raw_value).strip()
+    return [text] if text else []
 
 def _single_column(schema: Dict[str, List[str]], key: str, fallback: str | None) -> str | None:
     columns = _schema_columns(schema, key, fallback)
@@ -192,6 +231,7 @@ def load_workbook_data(path: str | Path) -> WorkbookData:
     layer_schema = data.schema_map.get("LAYERS", {})
     fx_schema = data.schema_map.get("FX", {})
     character_schema = data.schema_map.get("CHARACTERS", {})
+    expr_preset_schema = data.schema_map.get("EXPRESSION_PRESETS", {})
 
     if "TELP_PATTERNS" in wb.sheetnames:
         for r in iter_nonempty(load_sheet_dictionaries(wb["TELP_PATTERNS"])):
@@ -237,6 +277,28 @@ def load_workbook_data(path: str | Path) -> WorkbookData:
             if name not in data.characters:
                 data.characters[name] = Character(name=name)
             data.characters[name].parts[part] = base_path
+
+    if "EXPRESSION_PRESETS" in wb.sheetnames:
+        for r in iter_nonempty(load_sheet_dictionaries(wb["EXPRESSION_PRESETS"])):
+            preset_id = _string_or_none(_row_value(r, expr_preset_schema, "preset_id", "プリセットID"))
+            if not preset_id:
+                continue
+            tones_raw = _row_value(r, expr_preset_schema, "tones", "トーン")
+            tones = _split_tokens(tones_raw)
+            character = _string_or_none(_row_value(r, expr_preset_schema, "character", "キャラクター"))
+            notes = _string_or_none(_row_value(r, expr_preset_schema, "notes", "備考"))
+            parts: Dict[str, str] = {}
+            for schema_key, fallback in EXPR_PART_SCHEMA:
+                value = _string_or_none(_row_value(r, expr_preset_schema, schema_key, fallback))
+                if value:
+                    parts[fallback] = value
+            data.expression_presets[preset_id] = ExpressionPreset(
+                preset_id=preset_id,
+                character=character,
+                tones=tones,
+                parts=parts,
+                notes=notes,
+            )
 
     if "LAYERS" in wb.sheetnames:
         for r in iter_nonempty(load_sheet_dictionaries(wb["LAYERS"])):
@@ -311,12 +373,27 @@ def load_workbook_data(path: str | Path) -> WorkbookData:
             character_columns = _schema_columns(timeline_schema, "character", "キャラクター")
 
             for i, r in enumerate(iter_nonempty(records), 1):
-                expr = {
-                    part: filename
-                    for column, parts in expr_cols.items()
-                    if column and (filename := _string_or_none(r.get(column)))
-                    for part in parts
-                }
+                expr: Dict[str, str] = {}
+                expr_note_presets: List[str] = []
+                expr_note_tones: List[str] = []
+                for column, parts in expr_cols.items():
+                    raw_value = _string_or_none(r.get(column))
+                    if not raw_value:
+                        continue
+                    preset_ids, tone_hints, expressions = _parse_expression_cell(raw_value)
+                    if preset_ids:
+                        expr_note_presets.extend(preset_ids)
+                    if tone_hints:
+                        expr_note_tones.extend(tone_hints)
+                    if expressions:
+                        value_to_apply = expressions[-1]
+                        for part in parts:
+                            expr[part] = value_to_apply
+                expr_notes: Dict[str, List[str]] = {}
+                if expr_note_presets:
+                    expr_notes["expression_presets"] = list(dict.fromkeys(expr_note_presets))
+                if expr_note_tones:
+                    expr_notes["expression_tones"] = list(dict.fromkeys(expr_note_tones))
                 objs = []
                 for column in object_columns:
                     identifier = _string_or_none(r.get(column))
@@ -369,6 +446,10 @@ def load_workbook_data(path: str | Path) -> WorkbookData:
                         )
 
                 notes: Dict[str, Any] = {}
+                if hints := expr_notes.get("expression_presets"):
+                    notes["expression_presets"] = hints
+                if tone_hints := expr_notes.get("expression_tones"):
+                    notes["expression_tones"] = tone_hints
                 if fx_param_raw not in (None, {}):
                     notes["fx_params"] = fx_param_raw
                 if approval := _string_or_none(_first_nonempty(r, approval_columns)):
@@ -435,6 +516,40 @@ def _normalize_identifier(value: Any) -> str | None:
         return text or None
     text = str(value).strip()
     return text or None
+
+
+def _parse_expression_cell(value: str) -> tuple[List[str], List[str], List[str]]:
+    normalized = (
+        value
+        .replace(";", ",")
+        .replace("|", ",")
+        .replace("｜", ",")
+        .replace("；", ",")
+        .replace("，", ",")
+        .replace("：", ":")
+    )
+    tokens = [chunk.strip() for chunk in normalized.split(",")]
+    preset_ids: List[str] = []
+    tone_hints: List[str] = []
+    expressions: List[str] = []
+    for token in tokens:
+        if not token:
+            continue
+        lowered = token.lower()
+        if lowered.startswith("preset:"):
+            preset_ids.append(token.split(":", 1)[1].strip())
+            continue
+        if token.startswith("プリセット:"):
+            preset_ids.append(token.split(":", 1)[1].strip())
+            continue
+        if lowered.startswith("tone:"):
+            tone_hints.append(token.split(":", 1)[1].strip())
+            continue
+        if token.startswith("トーン:"):
+            tone_hints.append(token.split(":", 1)[1].strip())
+            continue
+        expressions.append(token)
+    return preset_ids, tone_hints, expressions
 
 
 def _parse_fx_params(raw: Any) -> Any:

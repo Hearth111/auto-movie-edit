@@ -6,9 +6,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 from datetime import datetime
 
-from .models import FxPreset, Pack, TimelineFx, TimelineObject, TimelineRow, WorkbookData
+from .language import LanguageAnalyzer
+from .models import (
+    ExpressionPreset,
+    FxPreset,
+    Pack,
+    TimelineFx,
+    TimelineObject,
+    TimelineRow,
+    WorkbookData,
+)
 from .proposals import update_proposal_model
-from .utils import dump_json, contains_hiragana
+from .utils import dump_json, contains_hiragana, ensure_list
 
 class BuildWarning:
     """Represents a warning produced during project build."""
@@ -26,6 +35,18 @@ class ProjectBuilder:
         self.characters_in_use: Set[str] = set()
         self.band_width = 10
         self.history_entries: List[Dict[str, Any]] = []
+        self.language_analyzer = LanguageAnalyzer()
+        self.expression_presets_by_tone: Dict[str, List[ExpressionPreset]] = {}
+        self.default_expression_presets: List[ExpressionPreset] = []
+        for preset in self.data.expression_presets.values():
+            if not preset.tones:
+                self.default_expression_presets.append(preset)
+                continue
+            for tone in preset.tones:
+                normalized = self._normalize_tone(tone)
+                if not normalized:
+                    continue
+                self.expression_presets_by_tone.setdefault(normalized, []).append(preset)
         self.tachie_scaffold = {
             "$type": "YukkuriMovieMaker.Project.Items.TachieItem, YukkuriMovieMaker",
             "CharacterName": "キャラクター名",
@@ -60,10 +81,104 @@ class ProjectBuilder:
             
         return project
 
+    @staticmethod
+    def _normalize_tone(value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        lowered = text.lower()
+        if lowered in {"default", "auto"}:
+            return None
+        return text
+
+    def _resolve_tone_hints(self, notes: Dict[str, Any]) -> tuple[bool, List[str]]:
+        disable_auto = False
+        tone_hints: List[str] = []
+        for candidate in ensure_list(notes.get("expression_tones")):
+            text = str(candidate).strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            if lowered in {"off", "none", "disable"} or text in {"オフ", "無効", "なし"}:
+                disable_auto = True
+                continue
+            tone_hints.append(text)
+        return disable_auto, tone_hints
+
+    def _select_preset_for_tone(self, tone: str | None, character: str | None) -> ExpressionPreset | None:
+        candidates = (
+            self.default_expression_presets
+            if tone is None
+            else self.expression_presets_by_tone.get(tone, [])
+        )
+        if not candidates:
+            return None
+        for preset in candidates:
+            if preset.character and preset.character == character:
+                return preset
+        for preset in candidates:
+            if not preset.character:
+                return preset
+        return None
+
+    def _apply_preset_parts(self, preset: ExpressionPreset, row: TimelineRow) -> bool:
+        changed = False
+        for part, value in preset.parts.items():
+            if not value:
+                continue
+            if part not in row.expressions:
+                row.expressions[part] = value
+                changed = True
+        return changed
+
+    def _apply_expression_presets(self, row: TimelineRow) -> None:
+        if not row.character:
+            return
+        if row.expressions is None:
+            row.expressions = {}
+        if row.notes is None:
+            row.notes = {}
+        notes = row.notes
+        for preset_id in ensure_list(notes.get("expression_presets")):
+            preset = self.data.expression_presets.get(str(preset_id))
+            if not preset:
+                continue
+            if preset.character and preset.character != row.character:
+                continue
+            self._apply_preset_parts(preset, row)
+
+        disable_auto, tone_hints = self._resolve_tone_hints(notes)
+        if disable_auto:
+            return
+
+        tone_candidates: List[str] = []
+        for tone_hint in tone_hints:
+            normalized = self._normalize_tone(tone_hint)
+            if normalized and normalized not in tone_candidates:
+                tone_candidates.append(normalized)
+
+        detected = self.language_analyzer.detect_tone(row.subtitle)
+        normalized_detected = self._normalize_tone(detected)
+        if normalized_detected and normalized_detected not in tone_candidates:
+            tone_candidates.append(normalized_detected)
+
+        for tone in tone_candidates:
+            preset = self._select_preset_for_tone(tone, row.character)
+            if preset and self._apply_preset_parts(preset, row):
+                return
+
+        default_preset = self._select_preset_for_tone(None, row.character)
+        if default_preset:
+            self._apply_preset_parts(default_preset, row)
+
     def _build_row_items(self, row: TimelineRow) -> List[dict[str, Any]]:
         """Builds timeline items and collects character names used in the row."""
         placements: List[dict[str, Any]] = []
         order_counter = 0
+
+        self._apply_expression_presets(row)
 
         def register(items: List[dict[str, Any]], role: str | None, order: float, band: int | None = None) -> None:
             if not items:
