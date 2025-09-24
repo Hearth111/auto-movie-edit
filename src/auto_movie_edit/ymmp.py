@@ -1,6 +1,7 @@
 """Generation of YMM4-compatible project structures."""
 
 from __future__ import annotations
+import copy
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
@@ -479,7 +480,7 @@ class ProjectBuilder:
             self._warn(row, f"Unresolved template path{context}: {file_path}")
 
     def _deep_copy(self, data: Any) -> Any:
-        return json.loads(json.dumps(data))
+        return copy.deepcopy(data)
 
     def _warn(self, row: TimelineRow, message: str): self.warnings.append(BuildWarning(row.index, message))
 
