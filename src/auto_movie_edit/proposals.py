@@ -12,7 +12,14 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Tuple
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from .language import LanguageAnalyzer
 
-__all__ = ["ProposalModel", "ProposalSuggestions", "update_proposal_model"]
+from .utils import TimecodeError, parse_timecode
+
+__all__ = [
+    "ProposalModel",
+    "ProposalSuggestions",
+    "ProposalCandidate",
+    "update_proposal_model",
+]
 
 
 _TOKEN_PATTERN = re.compile(r"[A-Za-z0-9ぁ-んァ-ヶ一-龯ー]+")
@@ -40,16 +47,42 @@ _APPROVAL_NEGATIVE = {
 
 
 @dataclass(slots=True)
+class ProposalCandidate:
+    """Represents a ranked proposal candidate."""
+
+    identifier: str
+    score: float
+    base_score: float
+    wins: int
+    losses: int
+    last_seen: Any | None = None
+    last_row_index: int | None = None
+    last_position: float | None = None
+
+
+@dataclass(slots=True)
 class ProposalSuggestions:
     """Container for ranked proposal candidates by category."""
 
-    items: Dict[str, List[Tuple[str, float]]] = field(default_factory=dict)
+    items: Dict[str, List[ProposalCandidate]] = field(default_factory=dict)
 
     def top(self, category: str, limit: int = 1) -> List[str]:
         """Return the best ``limit`` entries for ``category``."""
 
         ranked = self.items.get(category, [])
-        return [identifier for identifier, _ in ranked[:limit]]
+        return [candidate.identifier for candidate in ranked[:limit]]
+
+    def top_candidates(self, category: str, limit: int = 1) -> List[ProposalCandidate]:
+        """Return the best candidates including their scores."""
+
+        ranked = self.items.get(category, [])
+        return ranked[:limit]
+
+    def best(self, category: str) -> ProposalCandidate | None:
+        """Return the single best candidate if available."""
+
+        ranked = self.items.get(category, [])
+        return ranked[0] if ranked else None
 
     def has_data(self) -> bool:
         """Return ``True`` if at least one category has proposals."""
@@ -117,16 +150,36 @@ class ProposalModel:
             tokens.append("__global__")
             approved = self._normalize_approval(entry.get("notes", {}).get("approval"))
             timestamp = entry.get("timestamp")
+            row_index = self._int_value(entry.get("row_index"))
+            position = self._timeline_position(entry)
 
             recorded = False
-            recorded |= self._record_items(tokens, "telop", [entry.get("telop")], approved, timestamp)
-            recorded |= self._record_items(tokens, "pack", entry.get("packs", []), approved, timestamp)
+            recorded |= self._record_items(
+                tokens,
+                "telop",
+                [entry.get("telop")],
+                approved,
+                timestamp,
+                row_index,
+                position,
+            )
+            recorded |= self._record_items(
+                tokens,
+                "pack",
+                entry.get("packs", []),
+                approved,
+                timestamp,
+                row_index,
+                position,
+            )
             recorded |= self._record_items(
                 tokens,
                 "asset",
                 self._resolve_assets(entry.get("objects", [])),
                 approved,
                 timestamp,
+                row_index,
+                position,
             )
             recorded |= self._record_items(
                 tokens,
@@ -134,6 +187,8 @@ class ProposalModel:
                 [fx.get("fx_id") for fx in entry.get("fx", [])],
                 approved,
                 timestamp,
+                row_index,
+                position,
             )
 
             if recorded:
@@ -149,15 +204,22 @@ class ProposalModel:
         subtitle: str | None,
         limit: int = 3,
         analyzer: "LanguageAnalyzer" | None = None,
+        row_index: int | None = None,
+        position_seconds: float | None = None,
     ) -> ProposalSuggestions:
         """Return ranked proposal candidates for a subtitle."""
 
         tokens = self._tokenize(subtitle, analyzer=analyzer)
         tokens.append("__global__")
-        suggestions: Dict[str, List[Tuple[str, float]]] = {}
+        suggestions: Dict[str, List[ProposalCandidate]] = {}
         for category in ("telop", "pack", "asset", "fx"):
             aggregated = self._collect_candidates(tokens, category)
-            ranked = self._rank_candidates(aggregated, limit)
+            ranked = self._rank_candidates(
+                aggregated,
+                limit,
+                row_index=row_index,
+                position=position_seconds,
+            )
             if ranked:
                 suggestions[category] = ranked
         return ProposalSuggestions(items=suggestions)
@@ -172,6 +234,8 @@ class ProposalModel:
         items: Iterable[Any],
         approved: bool | None,
         timestamp: str | None,
+        row_index: int | None,
+        position: float | None,
     ) -> bool:
         recorded = False
         for item in items:
@@ -179,7 +243,15 @@ class ProposalModel:
             if not identifier:
                 continue
             for token in tokens:
-                if self._record(token, category, identifier, approved, timestamp):
+                if self._record(
+                    token,
+                    category,
+                    identifier,
+                    approved,
+                    timestamp,
+                    row_index,
+                    position,
+                ):
                     recorded = True
         return recorded
 
@@ -190,12 +262,21 @@ class ProposalModel:
         identifier: str,
         approved: bool | None,
         timestamp: str | None,
+        row_index: int | None,
+        position: float | None,
     ) -> bool:
         keyword_stats = self.stats.setdefault(token, {})
         category_stats = keyword_stats.setdefault(category, {})
         item_stats = category_stats.setdefault(
             identifier,
-            {"wins": 0, "losses": 0, "total": 0, "last_seen": timestamp},
+            {
+                "wins": 0,
+                "losses": 0,
+                "total": 0,
+                "last_seen": timestamp,
+                "last_row_index": row_index,
+                "last_position": position,
+            },
         )
 
         item_stats["total"] = int(item_stats.get("total", 0)) + 1
@@ -205,6 +286,24 @@ class ProposalModel:
             item_stats["losses"] = int(item_stats.get("losses", 0)) + 1
         if timestamp:
             item_stats["last_seen"] = timestamp
+        if row_index is not None:
+            try:
+                current_index = int(row_index)
+            except (TypeError, ValueError):
+                current_index = None
+            if current_index is not None:
+                previous_index = self._int_value(item_stats.get("last_row_index"))
+                if previous_index is None or current_index >= previous_index:
+                    item_stats["last_row_index"] = current_index
+        if position is not None:
+            try:
+                current_position = float(position)
+            except (TypeError, ValueError):
+                current_position = None
+            if current_position is not None:
+                previous_position = self._float_value(item_stats.get("last_position"))
+                if previous_position is None or current_position >= previous_position:
+                    item_stats["last_position"] = current_position
         return True
 
     def _collect_candidates(
@@ -216,7 +315,14 @@ class ProposalModel:
             for identifier, stats in category_stats.items():
                 target = aggregated.setdefault(
                     identifier,
-                    {"wins": 0, "losses": 0, "total": 0, "last_seen": None},
+                    {
+                        "wins": 0,
+                        "losses": 0,
+                        "total": 0,
+                        "last_seen": None,
+                        "last_row_index": None,
+                        "last_position": None,
+                    },
                 )
                 target["wins"] += int(stats.get("wins", 0))
                 target["losses"] += int(stats.get("losses", 0))
@@ -227,32 +333,79 @@ class ProposalModel:
                     or timestamp > target["last_seen"]
                 ):
                     target["last_seen"] = timestamp
+                row_index = self._int_value(stats.get("last_row_index"))
+                if row_index is not None:
+                    existing_row = target.get("last_row_index")
+                    if existing_row is None or row_index > existing_row:
+                        target["last_row_index"] = row_index
+                position = self._float_value(stats.get("last_position"))
+                if position is not None:
+                    existing_position = target.get("last_position")
+                    if existing_position is None or position > existing_position:
+                        target["last_position"] = position
         return aggregated
 
     def _rank_candidates(
-        self, candidates: Dict[str, Dict[str, Any]], limit: int
-    ) -> List[Tuple[str, float]]:
-        ranked: List[Tuple[str, Dict[str, Any]]] = sorted(
-            candidates.items(),
+        self,
+        candidates: Dict[str, Dict[str, Any]],
+        limit: int,
+        row_index: int | None,
+        position: float | None,
+    ) -> List[ProposalCandidate]:
+        scored: List[Tuple[ProposalCandidate, Dict[str, Any]]] = []
+        for identifier, stats in candidates.items():
+            base_score = self._score_candidate(stats)
+            if base_score <= 0:
+                continue
+            weight = self._context_weight(stats, row_index=row_index, position=position)
+            adjusted_score = base_score * weight
+            if adjusted_score <= 0:
+                continue
+            candidate = ProposalCandidate(
+                identifier=identifier,
+                score=round(adjusted_score, 4),
+                base_score=round(base_score, 4),
+                wins=int(stats.get("wins", 0)),
+                losses=int(stats.get("losses", 0)),
+                last_seen=stats.get("last_seen"),
+                last_row_index=self._int_value(stats.get("last_row_index")),
+                last_position=self._float_value(stats.get("last_position")),
+            )
+            scored.append((candidate, stats))
+
+        scored.sort(
             key=lambda item: (
-                self._score_candidate(item[1]),
-                int(item[1].get("wins", 0)),
-                -int(item[1].get("losses", 0)),
+                item[0].score,
+                item[0].base_score,
+                item[0].wins,
+                -item[0].losses,
                 self._timestamp_value(item[1].get("last_seen")),
-                item[0],
+                item[0].identifier,
             ),
             reverse=True,
         )
 
-        results: List[Tuple[str, float]] = []
-        for identifier, stats in ranked:
-            score = self._score_candidate(stats)
-            if score <= 0:
-                continue
-            results.append((identifier, round(score, 4)))
-            if len(results) >= limit:
-                break
-        return results
+        return [candidate for candidate, _ in scored[:limit]]
+
+    def _context_weight(
+        self,
+        stats: Dict[str, Any],
+        *,
+        row_index: int | None,
+        position: float | None,
+    ) -> float:
+        weight = 1.0
+        last_position = self._float_value(stats.get("last_position"))
+        if position is not None and last_position is not None:
+            gap = abs(position - last_position)
+            if gap < 30.0:
+                weight *= max(0.2, gap / 30.0)
+        last_row = self._int_value(stats.get("last_row_index"))
+        if row_index is not None and last_row is not None:
+            row_gap = abs(int(row_index) - last_row)
+            if row_gap <= 3:
+                weight *= max(0.3, row_gap / 3.0)
+        return weight
 
     @staticmethod
     def _score_candidate(stats: Dict[str, Any]) -> float:
@@ -264,6 +417,20 @@ class ProposalModel:
         base = wins - losses
         confidence = wins / total
         return base + confidence
+
+    @staticmethod
+    def _int_value(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _float_value(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _timestamp_value(value: Any) -> float:
@@ -279,6 +446,19 @@ class ProposalModel:
         except ValueError:
             return 0.0
         return dt.timestamp()
+
+    @staticmethod
+    def _timeline_position(entry: Dict[str, Any]) -> float | None:
+        start = entry.get("start")
+        if not start:
+            return None
+        try:
+            timecode = parse_timecode(str(start))
+        except TimecodeError:
+            return None
+        if timecode is None:
+            return None
+        return timecode.to_seconds()
 
     @staticmethod
     def _tokenize(

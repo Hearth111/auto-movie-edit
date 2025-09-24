@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from hashlib import md5
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import typer
 from openpyxl import Workbook, load_workbook
@@ -22,6 +22,13 @@ from .workbook import (
 from .ymmp import apply_hiragana_shrink, build_project, write_outputs
 
 app = typer.Typer(help="Auto Movie Edit CLI utilities")
+
+
+AUTO_APPLY_THRESHOLDS = {
+    "telop": 2.0,
+    "pack": 1.8,
+    "asset": 1.8,
+}
 
 
 @app.command("make-sheet")
@@ -61,27 +68,59 @@ def make_sheet(
 
         memo_segments: list[str] = []
         if proposal_model:
-            suggestions = proposal_model.suggest(entry.text, analyzer=language_analyzer)
+            suggestions = proposal_model.suggest(
+                entry.text,
+                analyzer=language_analyzer,
+                row_index=row_index,
+                position_seconds=entry.start.to_seconds(),
+            )
             if suggestions.has_data():
-                telops = suggestions.top("telop")
-                if telops:
-                    timeline_sheet.cell(row=row_index, column=4, value=telops[0])
-                packs = suggestions.top("pack")
-                if packs:
-                    timeline_sheet.cell(row=row_index, column=9, value=packs[0])
-                assets = suggestions.top("asset")
-                if assets:
-                    timeline_sheet.cell(row=row_index, column=10, value=assets[0])
                 suggestion_segments: list[str] = []
-                if telops:
-                    suggestion_segments.append(f"テロップ:{', '.join(telops[:3])}")
-                if packs:
-                    suggestion_segments.append(f"パック:{', '.join(packs[:3])}")
-                if assets:
-                    suggestion_segments.append(f"オブジェクト:{', '.join(assets[:3])}")
-                fx_candidates = suggestions.top("fx", limit=3)
+                confirmed_segments: list[str] = []
+
+                def _auto_apply(
+                    category: str,
+                    column: int,
+                    label: str,
+                    limit: int = 3,
+                ) -> List[str]:
+                    candidates = suggestions.top_candidates(category, limit=limit)
+                    if not candidates:
+                        return []
+                    names = [candidate.identifier for candidate in candidates]
+                    threshold = AUTO_APPLY_THRESHOLDS.get(category)
+                    best = candidates[0]
+                    if (
+                        threshold is not None
+                        and best.base_score >= threshold
+                        and column > 0
+                    ):
+                        timeline_sheet.cell(row=row_index, column=column, value=best.identifier)
+                        confirmed_segments.append(
+                            f"{label}:{best.identifier}(信頼度{best.base_score:.2f})"
+                        )
+                    return names
+
+                telop_names = _auto_apply("telop", 4, "テロップ")
+                if telop_names:
+                    suggestion_segments.append(f"テロップ:{', '.join(telop_names)}")
+
+                pack_names = _auto_apply("pack", 9, "パック")
+                if pack_names:
+                    suggestion_segments.append(f"パック:{', '.join(pack_names)}")
+
+                asset_names = _auto_apply("asset", 10, "オブジェクト")
+                if asset_names:
+                    suggestion_segments.append(f"オブジェクト:{', '.join(asset_names)}")
+
+                fx_candidates = suggestions.top_candidates("fx", limit=3)
                 if fx_candidates:
-                    suggestion_segments.append(f"FX:{', '.join(fx_candidates)}")
+                    suggestion_segments.append(
+                        "FX:" + ", ".join(candidate.identifier for candidate in fx_candidates)
+                    )
+
+                if confirmed_segments:
+                    memo_segments.append("AI確定 " + " / ".join(confirmed_segments))
                 if suggestion_segments:
                     memo_segments.append("AI候補 " + " / ".join(suggestion_segments))
 
