@@ -4,9 +4,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 from collections.abc import Mapping, Sequence
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, NamedTuple, Set, Tuple
 from datetime import datetime
 
 from .language import LanguageAnalyzer
@@ -20,10 +21,107 @@ from .models import (
     WorkbookData,
 )
 from .proposals import update_proposal_model
-from .utils import dump_json, contains_hiragana, ensure_list
+from .utils import dump_json, contains_hiragana, count_hiragana, ensure_list
 
 
 _SCAFFOLD_CACHE: Dict[Path, tuple[float, int, dict[str, Any]]] = {}
+
+_TACHIE_ALLOWED_EXTENSIONS: tuple[str, ...] = (".png", ".webp", ".jpg", ".jpeg", ".avif")
+_TACHIE_FALLBACK_NAMES: tuple[str, ...] = ("default", "base", "normal", "通常", "ノーマル")
+
+
+class TachieExpressionResolution(NamedTuple):
+    path: Path | None
+    used_fallback: bool
+    attempts: Tuple[Path, ...]
+
+
+def _loose_resolve(path: Path) -> Path:
+    expanded = path.expanduser()
+    try:
+        return expanded.resolve(strict=False)
+    except FileNotFoundError:
+        return expanded
+
+
+def _resolve_tachie_expression_path(base_path: str, expression: str) -> TachieExpressionResolution:
+    expression = expression.strip()
+    if not expression:
+        return TachieExpressionResolution(None, False, tuple())
+
+    placeholders = {"expression": expression, "expr": expression, "name": expression}
+    formatted_path = base_path
+    try:
+        formatted_path = base_path.format(**placeholders)
+    except (KeyError, ValueError):
+        formatted_path = base_path
+
+    candidate_strings = []
+    for candidate in (formatted_path, base_path):
+        if candidate and candidate not in candidate_strings:
+            candidate_strings.append(candidate)
+
+    attempt_entries: List[tuple[Path, bool]] = []
+    search_roots: List[Path] = []
+    seen_roots: set[Path] = set()
+
+    for candidate_str in candidate_strings:
+        base_candidate = _loose_resolve(Path(candidate_str))
+        if base_candidate.is_file():
+            return TachieExpressionResolution(base_candidate, False, (base_candidate,))
+        if base_candidate.suffix and not base_candidate.is_dir():
+            attempt_entries.append((base_candidate, False))
+            parent = base_candidate.parent
+            if parent not in seen_roots:
+                search_roots.append(parent)
+                seen_roots.add(parent)
+        else:
+            if base_candidate not in seen_roots:
+                search_roots.append(base_candidate)
+                seen_roots.add(base_candidate)
+
+    def _expression_variants(expr: str) -> List[str]:
+        variants = [expr]
+        if "." not in expr:
+            lowered = expr.lower()
+            if lowered not in variants:
+                variants.append(lowered)
+            normalized = expr.replace(" ", "_")
+            if normalized not in variants:
+                variants.append(normalized)
+        return variants
+
+    variants = _expression_variants(expression)
+    for root in search_roots:
+        if root.is_file():
+            attempt_entries.append((root, False))
+            continue
+        for variant in variants:
+            variant_path = Path(variant)
+            if variant_path.suffix:
+                candidate = _loose_resolve(root / variant_path)
+                attempt_entries.append((candidate, False))
+            else:
+                for ext in _TACHIE_ALLOWED_EXTENSIONS:
+                    candidate = _loose_resolve(root / f"{variant}{ext}")
+                    attempt_entries.append((candidate, False))
+        for fallback_name in _TACHIE_FALLBACK_NAMES:
+            fallback_variant = Path(fallback_name)
+            if fallback_variant.suffix:
+                candidate = _loose_resolve(root / fallback_variant)
+                attempt_entries.append((candidate, True))
+            else:
+                for ext in _TACHIE_ALLOWED_EXTENSIONS:
+                    candidate = _loose_resolve(root / f"{fallback_name}{ext}")
+                    attempt_entries.append((candidate, True))
+
+    attempts: List[Path] = []
+    for candidate, is_fallback in attempt_entries:
+        attempts.append(candidate)
+        if candidate.exists():
+            return TachieExpressionResolution(candidate, is_fallback, tuple(attempts))
+
+    return TachieExpressionResolution(None, False, tuple(attempts))
 
 
 def _load_scaffold_project(scaffold_path: Path) -> dict[str, Any]:
@@ -76,6 +174,7 @@ class ProjectBuilder:
             "目": "Eye", "口": "Mouth", "眉": "Eyebrow", "髪": "Hair", "体": "Body",
             "顔色": "Complexion", "他1": "Etc1", "他2": "Etc2", "他3": "Etc3"
         }
+        self._tachie_last_paths: Dict[tuple[str, str], str] = {}
 
     def build(self) -> dict[str, Any]:
         """Builds the final YMM4 project by injecting items and characters into a scaffold file."""
@@ -251,8 +350,34 @@ class ProjectBuilder:
                     for part_jp, expr_fn in row.expressions.items():
                         part_en = self.part_map.get(part_jp)
                         base_path = char_def.parts.get(part_jp) if char_def else None
+                        key = (char_def.name, part_en) if part_en else None
                         if part_en and base_path:
-                            params[part_en] = str((Path(base_path) / f"{expr_fn}.png").resolve())
+                            resolution = _resolve_tachie_expression_path(base_path, expr_fn)
+                            if resolution.path:
+                                params[part_en] = str(resolution.path)
+                                if key:
+                                    self._tachie_last_paths[key] = str(resolution.path)
+                                if resolution.used_fallback:
+                                    self._warn(
+                                        row,
+                                        f"Tachie expression '{expr_fn}' missing for part '{part_jp}'. Fallback to '{resolution.path.name}'",
+                                    )
+                            else:
+                                reused = key and self._tachie_last_paths.get(key)
+                                if reused:
+                                    params[part_en] = reused
+                                    self._warn(
+                                        row,
+                                        f"Tachie expression '{expr_fn}' missing for part '{part_jp}'. Reusing previous '{Path(reused).name}'",
+                                    )
+                                else:
+                                    attempted_names = [p.name for p in resolution.attempts if p and p.name]
+                                    attempts = ", ".join(dict.fromkeys(attempted_names[-5:])) if attempted_names else ""
+                                    detail = f" Tried: {attempts}" if attempts else ""
+                                    self._warn(
+                                        row,
+                                        f"Tachie expression file not found for part '{part_jp}' of '{char_def.name}' (expr '{expr_fn}').{detail}",
+                                    )
                         elif not part_en:
                             self._warn(row, f"Unknown tachie part: {part_jp}")
                         else:
@@ -649,11 +774,101 @@ def _write_history_entries(history: List[Dict[str, Any]], warnings: List[BuildWa
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     return len(enriched)
 
+
+def _first_numeric_value(data: Any, default: float = 100.0) -> float:
+    if isinstance(data, Mapping):
+        values = data.get("Values")
+        if isinstance(values, list):
+            for entry in values:
+                if isinstance(entry, Mapping):
+                    candidate = entry.get("Value")
+                    if isinstance(candidate, (int, float)):
+                        return float(candidate)
+        candidate = data.get("Value")
+        if isinstance(candidate, (int, float)):
+            return float(candidate)
+    elif isinstance(data, list):
+        for entry in data:
+            if isinstance(entry, Mapping):
+                candidate = entry.get("Value")
+                if isinstance(candidate, (int, float)):
+                    return float(candidate)
+            elif isinstance(entry, (int, float)):
+                return float(entry)
+    return default
+
+
+def _estimate_text_layout(item: Mapping[str, Any]) -> tuple[int, int, int]:
+    text = str(item.get("Text", ""))
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        lines = [text.strip()] if text.strip() else [text]
+    line_count = max(1, len(lines))
+    longest_line = max((len(line) for line in lines), default=len(text))
+    total_chars = sum(len(line) for line in lines) or len(text)
+    return line_count, longest_line, total_chars
+
+
+def _determine_hiragana_scale(item: Mapping[str, Any], base_scale: float) -> float:
+    text = str(item.get("Text", ""))
+    if not text.strip():
+        return min(1.0, max(base_scale, 0.6))
+
+    line_count, longest_line, total_chars = _estimate_text_layout(item)
+    hira_count = count_hiragana(text)
+    effective_chars = max(1, total_chars)
+    hira_ratio = hira_count / effective_chars
+
+    shrink_strength = math.pow(hira_ratio, 0.7)
+    dynamic_scale = 1 - (1 - base_scale) * shrink_strength
+
+    font_size = _first_numeric_value(item.get("FontSize"), default=100.0)
+    base_zoom = _first_numeric_value(item.get("Zoom"), default=100.0)
+    char_width = font_size * 0.62
+    approx_width = char_width * max(1, longest_line) * (base_zoom / 100.0)
+    target_width = 1080 * 0.9  # assume portrait 1080x1920 canvas
+    if target_width > 0:
+        width_ratio = approx_width / target_width
+        if width_ratio > 1.0:
+            dynamic_scale = min(dynamic_scale, 1.0 / width_ratio)
+        else:
+            slack = 1.0 - width_ratio
+            if slack > 0.15:
+                dynamic_scale = min(1.0, dynamic_scale + slack * 0.35)
+
+    if line_count > 2:
+        dynamic_scale *= 0.98 ** (line_count - 2)
+    elif line_count == 1 and longest_line <= 6:
+        dynamic_scale = min(1.0, dynamic_scale + 0.05)
+
+    return max(0.55, min(dynamic_scale, 1.0))
+
+
 def apply_hiragana_shrink(project_path: str | Path, output_path: str | Path, scale: float):
     project = json.loads(Path(project_path).read_text("utf-8-sig"))
     for timeline in project.get("Timelines", []):
         for item in timeline.get("Items", []):
             if "TextItem" in item.get("$type", "") and contains_hiragana(item.get("Text")):
-                if "Zoom" in item and "Values" in item["Zoom"]:
-                    item["Zoom"]["Values"] = [{"Value": round(float(z.get("Value", 100.0)) * scale, 4)} for z in item["Zoom"]["Values"]]
+                zoom_block = item.get("Zoom")
+                if isinstance(zoom_block, Mapping):
+                    values = zoom_block.get("Values")
+                else:
+                    values = None
+                if isinstance(values, list) and values:
+                    base_value = _first_numeric_value(values, default=100.0)
+                    if base_value == 0:
+                        base_value = 100.0
+                    ratios: List[float] = []
+                    for entry in values:
+                        current = entry.get("Value") if isinstance(entry, Mapping) else None
+                        current_value = float(current) if isinstance(current, (int, float)) else base_value
+                        ratios.append(current_value / base_value if base_value else 1.0)
+                    dynamic_scale = _determine_hiragana_scale(item, scale)
+                    new_base = base_value * dynamic_scale
+                    new_values: List[dict[str, Any]] = []
+                    for entry, ratio in zip(values, ratios):
+                        updated = dict(entry) if isinstance(entry, Mapping) else {"Value": entry}
+                        updated["Value"] = round(new_base * ratio, 4)
+                        new_values.append(updated)
+                    zoom_block["Values"] = new_values
     dump_json(output_path, project)
