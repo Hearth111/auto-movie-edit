@@ -423,15 +423,71 @@ class ProjectBuilder:
     def _create_item_from_template(self, template: dict | list | None, row: TimelineRow) -> dict:
         resolved_template = self._resolve_template_dict(template)
         item = self._clone_template(resolved_template)
-        if row.start:
-            frame_value = int(row.start.to_seconds() * self.fps)
-            item["Frame"] = frame_value
+        row_start_frame = int(row.start.to_seconds() * self.fps) if row.start else None
+        row_length_frames: int | None = None
         if row.start and row.end:
             start_seconds = row.start.to_seconds()
             end_seconds = row.end.to_seconds()
             length_seconds = max(0.0, end_seconds - start_seconds)
-            item["Length"] = int(length_seconds * self.fps)
+            row_length_frames = int(length_seconds * self.fps)
+        self._apply_relative_timing(item, row_start_frame, row_length_frames, is_root=True)
         return item
+
+    def _apply_relative_timing(
+        self,
+        data: Any,
+        row_start_frame: int | None,
+        row_length_frames: int | None,
+        *,
+        is_root: bool,
+    ) -> Any:
+        if isinstance(data, dict):
+            frame_offset = data.pop("FrameOffset", None)
+            frame_value: int | None = None
+            if frame_offset is not None:
+                try:
+                    frame_value = int(frame_offset)
+                except (TypeError, ValueError):
+                    frame_value = None
+                if frame_value is not None:
+                    base_frame = row_start_frame if row_start_frame is not None else 0
+                    data["Frame"] = base_frame + frame_value
+            elif is_root and row_start_frame is not None and "Frame" not in data:
+                data["Frame"] = row_start_frame
+
+            length_offset = data.pop("LengthFrames", None)
+            length_value: int | None = None
+            if length_offset is not None:
+                try:
+                    length_value = int(length_offset)
+                except (TypeError, ValueError):
+                    length_value = None
+                if length_value is not None:
+                    data["Length"] = length_value
+            elif (
+                is_root
+                and row_length_frames is not None
+                and "Length" not in data
+                and row_start_frame is not None
+            ):
+                data["Length"] = row_length_frames
+
+            for key, value in list(data.items()):
+                data[key] = self._apply_relative_timing(
+                    value,
+                    row_start_frame,
+                    row_length_frames,
+                    is_root=False,
+                )
+            return data
+
+        if isinstance(data, list):
+            return [
+                self._apply_relative_timing(item, row_start_frame, row_length_frames, is_root=False)
+                for item in data
+            ]
+
+        return data
 
     def _instantiate_object(self, obj: TimelineObject, row: TimelineRow) -> List[dict[str, Any]]:
         items: List[dict[str, Any]] = []
