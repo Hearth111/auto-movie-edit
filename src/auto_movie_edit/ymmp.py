@@ -792,6 +792,8 @@ def _first_numeric_value(data: Any, default: float = 100.0) -> float:
         candidate = data.get("Value")
         if isinstance(candidate, (int, float)):
             return float(candidate)
+    elif isinstance(data, (int, float)):
+        return float(data)
     elif isinstance(data, list):
         for entry in data:
             if isinstance(entry, Mapping):
@@ -849,31 +851,83 @@ def _determine_hiragana_scale(item: Mapping[str, Any], base_scale: float) -> flo
     return max(0.55, min(dynamic_scale, 1.0))
 
 
+def _determine_zoom_base(zoom_data: Any, default: float = 100.0) -> float:
+    if isinstance(zoom_data, Mapping):
+        values = zoom_data.get("Values")
+        if isinstance(values, list) and values:
+            base_value = _first_numeric_value(values, default=default)
+        else:
+            base_value = _first_numeric_value(zoom_data, default=default)
+    elif isinstance(zoom_data, (int, float)):
+        base_value = float(zoom_data)
+    else:
+        base_value = default
+
+    if base_value == 0:
+        return default
+    return base_value
+
+
+def _zoom_entry_ratio(entry: Any, base_value: float) -> float:
+    if not base_value:
+        return 1.0
+
+    candidate: Any
+    if isinstance(entry, Mapping):
+        candidate = entry.get("Value")
+    else:
+        candidate = entry
+
+    if isinstance(candidate, (int, float)) and base_value:
+        return float(candidate) / base_value
+    return 1.0
+
+
+def _scale_zoom_entry(entry: Any, base_value: float, scaled_base: float) -> dict[str, Any]:
+    ratio = _zoom_entry_ratio(entry, base_value)
+    updated = dict(entry) if isinstance(entry, Mapping) else {"Value": entry}
+    updated["Value"] = round(scaled_base * ratio, 4)
+    return updated
+
+
+def _apply_zoom_scale(zoom_data: Any, base_value: float, dynamic_scale: float) -> Any:
+    scaled_base = base_value * dynamic_scale
+
+    if isinstance(zoom_data, Mapping):
+        values = zoom_data.get("Values")
+        if isinstance(values, list) and values:
+            updated = dict(zoom_data)
+            updated["Values"] = [
+                _scale_zoom_entry(entry, base_value, scaled_base) for entry in values
+            ]
+            return updated
+
+        candidate = zoom_data.get("Value")
+        if isinstance(candidate, (int, float)):
+            ratio = _zoom_entry_ratio(candidate, base_value)
+            updated = dict(zoom_data)
+            updated["Value"] = round(scaled_base * ratio, 4)
+            return updated
+
+        return zoom_data
+
+    if isinstance(zoom_data, (int, float)):
+        ratio = _zoom_entry_ratio(zoom_data, base_value)
+        return round(scaled_base * ratio, 4)
+
+    return zoom_data
+
+
 def apply_hiragana_shrink(project_path: str | Path, output_path: str | Path, scale: float):
     project = json.loads(Path(project_path).read_text("utf-8-sig"))
     for timeline in project.get("Timelines", []):
         for item in timeline.get("Items", []):
             if "TextItem" in item.get("$type", "") and contains_hiragana(item.get("Text")):
                 zoom_block = item.get("Zoom")
-                if isinstance(zoom_block, Mapping):
-                    values = zoom_block.get("Values")
-                else:
-                    values = None
-                if isinstance(values, list) and values:
-                    base_value = _first_numeric_value(values, default=100.0)
-                    if base_value == 0:
-                        base_value = 100.0
-                    ratios: List[float] = []
-                    for entry in values:
-                        current = entry.get("Value") if isinstance(entry, Mapping) else None
-                        current_value = float(current) if isinstance(current, (int, float)) else base_value
-                        ratios.append(current_value / base_value if base_value else 1.0)
-                    dynamic_scale = _determine_hiragana_scale(item, scale)
-                    new_base = base_value * dynamic_scale
-                    new_values: List[dict[str, Any]] = []
-                    for entry, ratio in zip(values, ratios):
-                        updated = dict(entry) if isinstance(entry, Mapping) else {"Value": entry}
-                        updated["Value"] = round(new_base * ratio, 4)
-                        new_values.append(updated)
-                    zoom_block["Values"] = new_values
+                if zoom_block is None:
+                    continue
+
+                base_value = _determine_zoom_base(zoom_block)
+                dynamic_scale = _determine_hiragana_scale(item, scale)
+                item["Zoom"] = _apply_zoom_scale(zoom_block, base_value, dynamic_scale)
     dump_json(output_path, project)

@@ -1,0 +1,29 @@
+{
+  "Timelines": [
+    {
+      "Items": [
+        {
+          "$type": "YukkuriMovieMaker.Project.Items.TextItem, YukkuriMovieMaker",
+          "Text": "あいうえおあいう",
+          "FontSize": 96,
+          "Zoom": 130.0,
+          "Frame": 0,
+          "Length": 60
+        },
+        {
+          "$type": "YukkuriMovieMaker.Project.Items.TextItem, YukkuriMovieMaker",
+          "Text": "あいうえおかきくけこさしすせそたちつてと",
+          "FontSize": 110,
+          "Zoom": {
+            "Values": [
+              {"Frame": 0, "Value": 180.0, "Ease": "Linear"},
+              {"Frame": 30, "Value": 210.0, "Ease": "Linear"}
+            ]
+          },
+          "Frame": 120,
+          "Length": 60
+        }
+      ]
+    }
+  ]
+}
