@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 import math
 import re
+from functools import lru_cache
 from typing import Dict, List, Sequence
 
 try:  # pragma: no cover - optional dependency loading
@@ -151,6 +152,9 @@ class LanguageAnalyzer:
     def __init__(self) -> None:
         self._tagger: Tagger | None = None  # type: ignore[assignment]
         self._tagger_error: Exception | None = None
+        self._tokenize_cached = lru_cache(maxsize=1024)(self._tokenize_internal)
+        self._keywords_cached = lru_cache(maxsize=512)(self._extract_keywords_internal)
+        self._tone_cached = lru_cache(maxsize=512)(self._compute_tone)
 
     # ------------------------------------------------------------------
     # Public API
@@ -184,46 +188,23 @@ class LanguageAnalyzer:
     def extract_keywords(self, text: str | None, limit: int = 5) -> List[str]:
         """Extract ``limit`` key terms from ``text`` using morphological analysis."""
 
-        if not text:
+        normalized = self._normalize_text(text)
+        if not normalized:
             return []
-
-        tokens = self.tokenize(text)
-        if not tokens:
-            tokens = [token.lower() for token in _WORD_PATTERN.findall(text)]
-        if not tokens:
+        if limit <= 0:
             return []
-
-        counter: Counter[str] = Counter()
-        for token in tokens:
-            if not token:
-                continue
-            counter[token] += 1
-
-        keywords = [word for word, _ in counter.most_common(limit)]
+        keywords = list(self._keywords_cached(normalized))
+        if limit < len(keywords):
+            return keywords[:limit]
         return keywords
 
     def tokenize(self, text: str | None) -> List[str]:
         """Tokenize ``text`` using Fugashi, falling back to regex segmentation."""
 
-        if not text:
+        normalized = self._normalize_text(text)
+        if not normalized:
             return []
-
-        self._ensure_tagger()
-        if self._tagger is None:
-            return [token.lower() for token in _WORD_PATTERN.findall(text)]
-
-        tokens: List[str] = []
-        for word in self._tagger(text):
-            pos = getattr(word.feature, "pos1", None) or getattr(word.feature, "pos", None)
-            if pos and pos not in _PRIMARY_POS:
-                continue
-            lemma = getattr(word.feature, "lemma", None)
-            surface = word.surface.strip()
-            candidate = (lemma or surface or "").strip()
-            if not candidate:
-                continue
-            tokens.append(candidate.lower())
-        return tokens
+        return list(self._tokenize_cached(normalized))
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -231,7 +212,10 @@ class LanguageAnalyzer:
     def detect_tone(self, text: str | None) -> str | None:
         """Public wrapper for tone detection used by other modules."""
 
-        return self._detect_emphasis(text)
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return None
+        return self._tone_cached(normalized)
 
     def _ensure_tagger(self) -> None:
         if self._tagger or self._tagger_error is not None:
@@ -245,15 +229,62 @@ class LanguageAnalyzer:
             self._tagger_error = exc
 
     def _detect_emphasis(self, text: str | None) -> str | None:
-        if not text:
-            return None
+        return self.detect_tone(text)
 
+    @staticmethod
+    def _normalize_text(text: str | None) -> str:
+        if text is None:
+            return ""
         stripped = text.strip()
         if not stripped:
+            return ""
+        return re.sub(r"\s+", " ", stripped)
+
+    def _tokenize_internal(self, normalized_text: str) -> tuple[str, ...]:
+        if not normalized_text:
+            return ()
+
+        self._ensure_tagger()
+        if self._tagger is None:
+            return tuple(token.lower() for token in _WORD_PATTERN.findall(normalized_text))
+
+        tokens: List[str] = []
+        for word in self._tagger(normalized_text):
+            pos = getattr(word.feature, "pos1", None) or getattr(word.feature, "pos", None)
+            if pos and pos not in _PRIMARY_POS:
+                continue
+            lemma = getattr(word.feature, "lemma", None)
+            surface = word.surface.strip()
+            candidate = (lemma or surface or "").strip()
+            if not candidate:
+                continue
+            tokens.append(candidate.lower())
+
+        if not tokens:
+            return tuple(token.lower() for token in _WORD_PATTERN.findall(normalized_text))
+        return tuple(tokens)
+
+    def _extract_keywords_internal(self, normalized_text: str) -> tuple[str, ...]:
+        if not normalized_text:
+            return ()
+
+        tokens = list(self._tokenize_cached(normalized_text))
+        if not tokens:
+            tokens = [token.lower() for token in _WORD_PATTERN.findall(normalized_text)]
+        if not tokens:
+            return ()
+
+        counter: Counter[str] = Counter(tokens)
+        return tuple(word for word, _ in counter.most_common())
+
+    def _compute_tone(self, normalized_text: str) -> str | None:
+        if not normalized_text:
             return None
 
+        stripped = normalized_text
+
         normalized_tail = re.sub(r"[\s。．\.！!？?〜ー…]*$", "", stripped)
-        tokens = self.tokenize(stripped)
+        tokens = list(self._tokenize_cached(stripped))
         if not tokens:
             tokens = [token.lower() for token in _WORD_PATTERN.findall(stripped)]
         counter = Counter(tokens)
