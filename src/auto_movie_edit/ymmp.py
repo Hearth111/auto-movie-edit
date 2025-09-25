@@ -30,6 +30,9 @@ _TACHIE_ALLOWED_EXTENSIONS: tuple[str, ...] = (".png", ".webp", ".jpg", ".jpeg",
 _TACHIE_FALLBACK_NAMES: tuple[str, ...] = ("default", "base", "normal", "通常", "ノーマル")
 
 
+_TACHIE_DIRECTORY_INDEX: Dict[Path, tuple[int | None, dict[str, Path]]] = {}
+
+
 class TachieExpressionResolution(NamedTuple):
     path: Path | None
     used_fallback: bool
@@ -42,6 +45,31 @@ def _loose_resolve(path: Path) -> Path:
         return expanded.resolve(strict=False)
     except FileNotFoundError:
         return expanded
+
+
+def _get_tachie_directory_listing(directory: Path) -> tuple[bool, dict[str, Path]]:
+    cached = _TACHIE_DIRECTORY_INDEX.get(directory)
+    try:
+        stat = directory.stat()
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        _TACHIE_DIRECTORY_INDEX[directory] = (None, {})
+        return False, {}
+
+    mtime = stat.st_mtime_ns
+    if cached and cached[0] == mtime:
+        return True, cached[1]
+
+    listing: dict[str, Path] = {}
+    try:
+        for entry in directory.iterdir():
+            if entry.is_file():
+                listing[entry.name.casefold()] = entry
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        _TACHIE_DIRECTORY_INDEX[directory] = (None, {})
+        return False, {}
+
+    _TACHIE_DIRECTORY_INDEX[directory] = (mtime, listing)
+    return True, listing
 
 
 def _resolve_tachie_expression_path(base_path: str, expression: str) -> TachieExpressionResolution:
@@ -115,10 +143,40 @@ def _resolve_tachie_expression_path(base_path: str, expression: str) -> TachieEx
                     candidate = _loose_resolve(root / f"{fallback_name}{ext}")
                     attempt_entries.append((candidate, True))
 
+    directory_cache: dict[Path, tuple[bool, dict[str, Path]]] = {}
+    exists_cache: dict[Path, bool] = {}
+
+    def _path_exists(path: Path) -> bool:
+        cached = exists_cache.get(path)
+        if cached is not None:
+            return cached
+        result = path.exists()
+        exists_cache[path] = result
+        return result
+
+    def _resolve_with_index(path: Path) -> Path | None:
+        parent = path.parent
+        if parent == path:
+            return path if _path_exists(path) else None
+        resolved_parent = parent
+        exists_listing = directory_cache.get(resolved_parent)
+        if exists_listing is None:
+            exists_listing = _get_tachie_directory_listing(resolved_parent)
+            directory_cache[resolved_parent] = exists_listing
+        exists, listing = exists_listing
+        if not exists:
+            return None
+        actual = listing.get(path.name.casefold())
+        return actual
+
     attempts: List[Path] = []
     for candidate, is_fallback in attempt_entries:
+        indexed_candidate = _resolve_with_index(candidate)
+        if indexed_candidate is not None:
+            attempts.append(indexed_candidate)
+            return TachieExpressionResolution(indexed_candidate, is_fallback, tuple(attempts))
         attempts.append(candidate)
-        if candidate.exists():
+        if _path_exists(candidate):
             return TachieExpressionResolution(candidate, is_fallback, tuple(attempts))
 
     return TachieExpressionResolution(None, False, tuple(attempts))
