@@ -308,7 +308,7 @@ def _extract_packs_from_raw_ymmp(project: dict, xlsx_path: Path) -> dict:
         if not _looks_like_pack(item):
             continue
 
-        sanitized = _strip_runtime_fields(item)
+        sanitized = _strip_runtime_fields(item, preserve_timing=True)
         digest = _hash_template(sanitized)
         if digest in seen_hashes:
             continue
@@ -345,7 +345,7 @@ def _extract_fx_from_raw_ymmp(project: dict, xlsx_path: Path, packs: Dict[str, D
         if not _looks_like_fx(item_type):
             continue
 
-        sanitized = _strip_runtime_fields(item)
+        sanitized = _strip_runtime_fields(item, preserve_timing=True)
         digest = _hash_template(sanitized)
         fx_id = f"fx_{digest[:8]}"
         if fx_id in extracted:
@@ -525,19 +525,60 @@ def _safe_filename(identifier: str) -> str:
     return sanitized or "template"
 
 
-def _strip_runtime_fields(data: Any, extra_keys: set[str] | None = None) -> Any:
+def _strip_runtime_fields(
+    data: Any,
+    extra_keys: set[str] | None = None,
+    *,
+    preserve_timing: bool = False,
+) -> Any:
     keys_to_remove = {"Frame", "Length"}
     if extra_keys:
         keys_to_remove = keys_to_remove.union(extra_keys)
-    if isinstance(data, dict):
-        return {
-            key: _strip_runtime_fields(value, extra_keys)
-            for key, value in data.items()
-            if key not in keys_to_remove
-        }
-    if isinstance(data, list):
-        return [_strip_runtime_fields(item, extra_keys) for item in data]
-    return data
+
+    def _find_min_frame(node: Any) -> int | None:
+        min_frame: int | None = None
+        if isinstance(node, dict):
+            for key, value in node.items():
+                candidate: int | None = None
+                if key == "Frame" and isinstance(value, (int, float)):
+                    candidate = int(value)
+                else:
+                    candidate = _find_min_frame(value)
+                if candidate is None:
+                    continue
+                if min_frame is None or candidate < min_frame:
+                    min_frame = candidate
+        elif isinstance(node, list):
+            for item in node:
+                candidate = _find_min_frame(item)
+                if candidate is None:
+                    continue
+                if min_frame is None or candidate < min_frame:
+                    min_frame = candidate
+        return min_frame
+
+    base_frame = _find_min_frame(data) if preserve_timing else None
+
+    def _strip(node: Any) -> Any:
+        if isinstance(node, dict):
+            cleaned: dict[str, Any] = {}
+            for key, value in node.items():
+                if key in keys_to_remove:
+                    if not preserve_timing:
+                        continue
+                    if key == "Frame" and isinstance(value, (int, float)):
+                        offset_base = base_frame or 0
+                        cleaned["FrameOffset"] = int(value) - int(offset_base)
+                    elif key == "Length" and isinstance(value, (int, float)):
+                        cleaned["LengthFrames"] = int(value)
+                    continue
+                cleaned[key] = _strip(value)
+            return cleaned
+        if isinstance(node, list):
+            return [_strip(item) for item in node]
+        return node
+
+    return _strip(data)
 
 
 def _hash_template(data: Any) -> str:
