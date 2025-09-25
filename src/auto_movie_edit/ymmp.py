@@ -154,6 +154,7 @@ class ProjectBuilder:
         self.expression_presets_by_tone: Dict[str, List[ExpressionPreset]] = {}
         self.default_expression_presets: List[ExpressionPreset] = []
         self._template_cache: Dict[tuple[str, Any], tuple[Mapping[str, Any], Tuple[tuple[str, Any], ...]]] = {}
+        self._tachie_resolution_cache: Dict[tuple[str, str], TachieExpressionResolution] = {}
         for preset in self.data.expression_presets.values():
             if not preset.tones:
                 self.default_expression_presets.append(preset)
@@ -352,7 +353,11 @@ class ProjectBuilder:
                         base_path = char_def.parts.get(part_jp) if char_def else None
                         key = (char_def.name, part_en) if part_en else None
                         if part_en and base_path:
-                            resolution = _resolve_tachie_expression_path(base_path, expr_fn)
+                            cache_key = (base_path, expr_fn)
+                            resolution = self._tachie_resolution_cache.get(cache_key)
+                            if resolution is None:
+                                resolution = _resolve_tachie_expression_path(base_path, expr_fn)
+                                self._tachie_resolution_cache[cache_key] = resolution
                             if resolution.path:
                                 params[part_en] = str(resolution.path)
                                 if key:
