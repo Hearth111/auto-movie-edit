@@ -851,24 +851,37 @@ def build_project(data: WorkbookData) -> Tuple[dict, List, List[Dict[str, Any]]]
     project = builder.build()
     return project, builder.warnings, builder.history_entries
 
-def write_outputs(project: dict, warnings: List, output_dir: str | Path, history: List[Dict[str, Any]] | None = None):
-    output_path = Path(output_dir); output_path.mkdir(parents=True, exist_ok=True)
+def write_outputs(
+    project: dict,
+    warnings: List,
+    output_dir: str | Path,
+    history: List[Dict[str, Any]] | None = None,
+    persistent_root: Path | str | None = None,
+):
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    storage_root = Path(persistent_root) if persistent_root else output_path
+    storage_root.mkdir(parents=True, exist_ok=True)
+
     project["FilePath"] = str((output_path / "out.ymmp").resolve())
     dump_json(output_path / "out.ymmp", project)
-    report = {"generated_at": datetime.utcnow().isoformat("T") + "Z", "warnings": [w.to_dict() for w in warnings]}
+    report = {
+        "generated_at": datetime.utcnow().isoformat("T") + "Z",
+        "warnings": [w.to_dict() for w in warnings],
+    }
     history_entries = history or []
-    history_count = _write_history_entries(history_entries, warnings, output_path)
-    model_path = update_proposal_model(history_entries, output_path)
+    history_count = _write_history_entries(history_entries, warnings, storage_root)
+    model_path = update_proposal_model(history_entries, storage_root)
     if history_count:
         report["history"] = {
             "count": history_count,
-            "directory": str((output_path / "history").resolve()),
+            "directory": str((storage_root / "history").resolve()),
         }
     if model_path:
         report.setdefault("ai", {})["proposal_model"] = str(Path(model_path).resolve())
     dump_json(output_path / "report.json", report)
 
-def _write_history_entries(history: List[Dict[str, Any]], warnings: List[BuildWarning], output_path: Path) -> int:
+def _write_history_entries(history: List[Dict[str, Any]], warnings: List[BuildWarning], base_path: Path) -> int:
     if not history:
         return 0
     warning_map: Dict[int, List[str]] = {}
@@ -885,7 +898,7 @@ def _write_history_entries(history: List[Dict[str, Any]], warnings: List[BuildWa
             enriched_entry["warnings"] = warning_map[row_index]
         enriched.append(enriched_entry)
 
-    date_dir = output_path / "history" / datetime.utcnow().strftime("%Y%m%d")
+    date_dir = base_path / "history" / datetime.utcnow().strftime("%Y%m%d")
     date_dir.mkdir(parents=True, exist_ok=True)
     history_path = date_dir / "history.jsonl"
     with history_path.open("a", encoding="utf-8") as fh:

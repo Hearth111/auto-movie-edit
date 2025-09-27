@@ -23,14 +23,15 @@ def main_wrapper():
         project_root = script_path.parent
         src_path = project_root / 'src'
         sys.path.insert(0, str(src_path))
-        from auto_movie_edit.cli import build
+        from auto_movie_edit.workbook import load_workbook_data
+        from auto_movie_edit.ymmp import build_project, write_outputs
 
         # --- UIによるファイル選択処理 ---
         def select_files():
             root = tk.Tk()
             root.withdraw()
             print("--- YMMPビルドプロセスを開始します ---")
-            
+
             workbook_file = filedialog.askopenfilename(
                 title="1. 読み込む台帳（Excelファイル）を選択してください",
                 filetypes=[("Excel Workbook", "*.xlsx")]
@@ -40,25 +41,28 @@ def main_wrapper():
                 return None, None
             print(f"✔️ 台帳ファイル: {Path(workbook_file).name}")
 
-            output_dir = filedialog.askdirectory(
-                title="2. YMMPファイルの出力先フォルダを選択してください",
-                initialdir=project_root
-            )
-            if not output_dir:
-                print("出力先フォルダの選択がキャンセルされました。")
-                return None, None
+            today_dir = project_root / datetime.now().strftime("%y%m%d")
+            output_dir = today_dir / Path(workbook_file).stem
+            output_dir.mkdir(parents=True, exist_ok=True)
+            print(f"✔️ 出力フォルダ: {output_dir}")
 
-            return Path(workbook_file), Path(output_dir)
+            return Path(workbook_file), output_dir
 
         # --- 実行処理本体 ---
         workbook_file, output_dir = select_files()
         if not workbook_file or not output_dir:
             print("処理を中断しました。")
             return
-            
-        build(sheet=workbook_file, out=output_dir)
+
+        model_dir = project_root / "model"
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        data = load_workbook_data(workbook_file)
+        project, warnings, history = build_project(data)
+        write_outputs(project, warnings, output_dir, history, persistent_root=model_dir)
         print(f"\n--- 正常に処理が完了しました ---")
-        print(f"YMMPプロジェクトが出力されました: {output_dir}")
+        print(f"YMMPプロジェクトが出力されました: {output_dir / 'out.ymmp'}")
+        print(f"AIモデルと履歴は次の場所に保存されます: {model_dir}")
 
     except Exception:
         # エラーが発生したら、それをファイルに書き出す
