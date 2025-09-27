@@ -2,6 +2,7 @@ import sys
 import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
+from datetime import datetime
 import traceback
 from openpyxl import load_workbook # Excelファイルを読み込むために追加
 
@@ -30,17 +31,24 @@ def select_files():
     
     print(f"✔️ SRTファイル: {Path(srt_file).name}")
 
+    today_dir = project_root / datetime.now().strftime("%y%m%d")
+    today_dir.mkdir(parents=True, exist_ok=True)
+
     workbook_file = filedialog.asksaveasfilename(
         title="2. 保存先のExcelファイル名を入力してください",
         filetypes=[("Excel Workbook", "*.xlsx")],
         defaultextension=".xlsx",
-        initialfile="timeline.xlsx"
+        initialfile="timeline.xlsx",
+        initialdir=today_dir
     )
     if not workbook_file:
         print("保存先ファイルの選択がキャンセルされました。")
         return None, None
-        
-    return Path(srt_file), Path(workbook_file)
+
+    workbook_path = today_dir / Path(workbook_file).name
+    print(f"✔️ 保存先フォルダ: {today_dir}")
+
+    return Path(srt_file), workbook_path
 
 # --- 実行処理本体 (ここが新しいロジックです) ---
 def main():
