@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>note風エディタ デモ</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --accent: #2f7cf6;
+      --bg: #f7f8fa;
+      --text: #1f2933;
+      --muted: #5f6b7c;
+      --border: #d8dde3;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Noto Sans JP", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background: var(--bg);
+    }
+
+    .page {
+      max-width: 960px;
+      margin: 32px auto 64px;
+      padding: 0 20px;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .header h1 {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: 0.02em;
+    }
+
+    .hint {
+      margin: 12px 0 24px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .editor-shell {
+      position: relative;
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 20px 22px;
+      box-shadow: 0 12px 30px rgba(24, 40, 66, 0.06);
+    }
+
+    #editor {
+      min-height: 320px;
+      line-height: 1.8;
+      font-size: 16px;
+      outline: none;
+    }
+
+    #editor:focus {
+      caret-color: var(--accent);
+    }
+
+    #editor h2 {
+      margin: 24px 0 8px;
+      font-size: 20px;
+      letter-spacing: 0.01em;
+    }
+
+    #editor blockquote {
+      margin: 12px 0;
+      padding-left: 16px;
+      border-left: 4px solid var(--accent);
+      color: #162033;
+      background: #f1f4f9;
+    }
+
+    #editor ul {
+      padding-left: 24px;
+    }
+
+    .toolbar {
+      position: absolute;
+      z-index: 10;
+      display: flex;
+      gap: 6px;
+      padding: 8px;
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(24, 40, 66, 0.1);
+      transform-origin: top left;
+      opacity: 1;
+      transition: opacity 0.12s ease, transform 0.12s ease;
+    }
+
+    .toolbar.hidden {
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(-6px) scale(0.98);
+    }
+
+    .toolbar button {
+      border: none;
+      background: transparent;
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 13px;
+      color: var(--text);
+      cursor: pointer;
+      transition: background 0.12s ease, color 0.12s ease;
+    }
+
+    .toolbar button:hover {
+      background: #eef3fb;
+    }
+
+    .toolbar button.active {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .toolbar button:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .toolbar button b,
+    .toolbar button i {
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <h1>note風のインライン編集メニュー</h1>
+    </div>
+    <p class="hint">テキストを選択すると、選択位置に合わせて太字・引用・見出し・箇条書きなどのメニューがポップアップします。</p>
+
+    <div class="editor-shell">
+      <div class="toolbar hidden" id="toolbar" aria-label="書式設定メニュー">
+        <button type="button" data-command="bold" aria-pressed="false"><b>太字</b></button>
+        <button type="button" data-command="italic" aria-pressed="false"><i>斜体</i></button>
+        <button type="button" data-command="formatBlock" data-value="h2" aria-pressed="false">見出し</button>
+        <button type="button" data-command="formatBlock" data-value="blockquote" aria-pressed="false">引用</button>
+        <button type="button" data-command="insertUnorderedList" aria-pressed="false">箇条書き</button>
+        <button type="button" data-command="removeFormat">書式クリア</button>
+      </div>
+
+      <div id="editor" contenteditable="true" spellcheck="false">
+        <h2>noteのような書き味を再現</h2>
+        <p>文章の一部をドラッグして選択すると、選択範囲のすぐそばにメニューが現れます。書きながら<b>太字</b>や<i>斜体</i>、引用の挿入をサッと切り替えられます。</p>
+        <blockquote>引用は左に帯を引いたスタイル。本文から浮き立たせたい一節に使えます。</blockquote>
+        <p>段落を整えるときは「見出し」や「箇条書き」を選んでください。もう一度同じボタンを押すと通常の段落に戻せます。</p>
+        <ul>
+          <li>太字・斜体・見出し・引用・箇条書きをサポート</li>
+          <li>選択範囲に追従してポップアップ</li>
+          <li>選択解除やフォーカス移動で自動的に隠れます</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const editor = document.getElementById("editor");
+    const toolbar = document.getElementById("toolbar");
+    const buttons = Array.from(toolbar.querySelectorAll("button[data-command]"));
+    let rafId = null;
+
+    const isSelectionInsideEditor = () => {
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount === 0) return false;
+      const range = selection.getRangeAt(0);
+      const node = range.commonAncestorContainer;
+      return editor.contains(node);
+    };
+
+    const getSelectionRect = () => {
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount === 0) return null;
+      const range = selection.getRangeAt(0).cloneRange();
+      if (range.getBoundingClientRect) {
+        const primary = range.getBoundingClientRect();
+        if (primary && (primary.width || primary.height)) {
+          return primary;
+        }
+      }
+      const rects = range.getClientRects();
+      return rects.length ? rects[0] : null;
+    };
+
+    const refreshActiveStates = () => {
+      buttons.forEach((btn) => {
+        const command = btn.dataset.command;
+        if (command === "removeFormat") {
+          btn.classList.remove("active");
+          btn.setAttribute("aria-pressed", "false");
+          return;
+        }
+
+        const value = btn.dataset.value?.toLowerCase();
+        let isActive = false;
+        if (command === "formatBlock" && value) {
+          const current = (document.queryCommandValue("formatBlock") || "").toLowerCase();
+          isActive = current === value || current === `<${value}>`;
+        } else {
+          isActive = document.queryCommandState(command);
+        }
+
+        btn.classList.toggle("active", Boolean(isActive));
+        btn.setAttribute("aria-pressed", String(Boolean(isActive)));
+      });
+    };
+
+    const updateToolbarPosition = () => {
+      if (!isSelectionInsideEditor()) {
+        toolbar.classList.add("hidden");
+        return;
+      }
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed) {
+        toolbar.classList.add("hidden");
+        return;
+      }
+
+      const rect = getSelectionRect();
+      if (!rect) {
+        toolbar.classList.add("hidden");
+        return;
+      }
+
+      const editorRect = editor.getBoundingClientRect();
+      const toolbarWidth = toolbar.offsetWidth;
+      const toolbarHeight = toolbar.offsetHeight;
+      const padding = 10;
+      const pageLeft = window.scrollX + editorRect.left;
+      const pageTop = window.scrollY + editorRect.top;
+
+      const top = window.scrollY + rect.top - toolbarHeight - 12;
+      const left = window.scrollX + rect.left + rect.width / 2 - toolbarWidth / 2;
+
+      const clampedTop = Math.max(pageTop + padding, top);
+      const clampedLeft = Math.max(pageLeft + padding, left);
+
+      toolbar.style.transform = `translate(${clampedLeft}px, ${clampedTop}px)`;
+      toolbar.classList.remove("hidden");
+      refreshActiveStates();
+    };
+
+    const scheduleToolbarUpdate = () => {
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(updateToolbarPosition);
+    };
+
+    buttons.forEach((btn) => {
+      btn.addEventListener("mousedown", (event) => event.preventDefault());
+      btn.addEventListener("click", () => {
+        const command = btn.dataset.command;
+        const value = btn.dataset.value || null;
+
+        if (command === "formatBlock" && value) {
+          const current = (document.queryCommandValue("formatBlock") || "").toLowerCase();
+          const normalizedValue = value.toLowerCase();
+          const nextBlock = current === normalizedValue || current === `<${normalizedValue}>` ? "p" : value;
+          document.execCommand("formatBlock", false, nextBlock);
+        } else if (command === "removeFormat") {
+          document.execCommand("removeFormat");
+          document.execCommand("formatBlock", false, "p");
+        } else {
+          document.execCommand(command, false, value);
+        }
+
+        editor.focus();
+        scheduleToolbarUpdate();
+      });
+    });
+
+    document.addEventListener("selectionchange", () => scheduleToolbarUpdate());
+    editor.addEventListener("keyup", scheduleToolbarUpdate);
+    editor.addEventListener("mouseup", scheduleToolbarUpdate);
+    editor.addEventListener("blur", () => toolbar.classList.add("hidden"));
+    window.addEventListener("scroll", () => toolbar.classList.add("hidden"), true);
+    window.addEventListener("resize", scheduleToolbarUpdate);
+  </script>
+</body>
+</html>
